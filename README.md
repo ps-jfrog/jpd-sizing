@@ -70,6 +70,7 @@ The effective tier is `max(client-implied, RPM-implied)`, computed on the growth
 - **Database setup** — the databases + DB users to create for each selected service (Artifactory, Xray (+JAS shares it), Distribution, Mission Control), the `CREATE DATABASE` template, a `system.yaml` connection block, required PostgreSQL version, and the `max_connections` floor derived from the tier's connection caps. Links to the JFrog database docs.
 - **External RabbitMQ setup** (when RMQ externalized) — recommended cluster size, required plugins, and a configuration checklist (vhost/user, quorum, ports, `system.yaml`). Links to the JFrog external-RabbitMQ docs.
 - **Derivation notes** — collapsible section explaining what's verbatim vs derived.
+- **Export to CSV** — the **⤓ Export to CSV** button (under *Calculate sizing*) downloads the full configuration as a multi-section CSV: inputs, aggregate footprint, per-component sizing (with an Active/Passive site column), the Kubernetes cluster plan, the databases to create, and any external-service recommendations (RabbitMQ / Valkey). Filename: `jpd-sizing-<cloud>-<tier>-<date>.csv`. Pure client-side download — no server.
 
 ---
 

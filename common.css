@@ -137,6 +137,19 @@
     margin-top: 6px;
   }
   button.calc:hover { background: var(--accent-2); color: #fff; }
+  button.export {
+    width: 100%;
+    background: transparent;
+    color: var(--accent);
+    font-weight: 600;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 10px;
+    cursor: pointer;
+    font-size: 13px;
+    margin-top: 8px;
+  }
+  button.export:hover { background: rgba(64, 191, 106, 0.08); }
   .output { display: flex; flex-direction: column; gap: 16px; }
   .summary-grid {
     display: grid;

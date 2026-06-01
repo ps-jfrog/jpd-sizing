@@ -308,3 +308,157 @@ function fmtGB(n) {
   if (n >= 1024) return (n / 1024).toFixed(1) + " TB";
   return n + " GB";
 }
+
+/* =============================================================================
+   CSV export. buildSizingCsv(r) serializes a render() result object into a
+   multi-section CSV. It introspects r, so it works for both the single-cluster
+   page (index.html) and the Active+Passive page (ha-index.html).
+   ============================================================================= */
+
+function csvEscape(v) {
+  if (v == null) v = "";
+  v = String(v);
+  return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+}
+
+function buildSizingCsv(r) {
+  const L = [];
+  const row = (...cells) => L.push(cells.map(csvEscape).join(","));
+  const blank = () => L.push("");
+
+  const deployLabel = r.deployment === "k8s" ? "Kubernetes" : "Virtual Machines";
+  const isAP = r.topology === "active-passive";
+
+  row("JFrog Platform Deployment (JPD) Sizing — Export");
+  row("Generated", new Date().toISOString());
+  blank();
+
+  /* Inputs */
+  row("[INPUTS]");
+  row("Field", "Value");
+  row("Target environment", r.cloudLabel);
+  row("Deployment model", deployLabel);
+  if (r.topology) row("Topology", isAP ? "Active + Passive (DR)" : "Single active cluster");
+  if (isAP) row("Passive site scale", r.passiveScale === "hot" ? "Hot (mirror)" : "Warm (minimal)");
+  if (r.deployment === "k8s" && r.k8sPlacement) row("Kubernetes placement", r.k8sPlacement === "antiaffinity" ? "Anti-affinity (shared pool)" : "Dedicated node pool");
+  row("Effective tier", String(r.tier || "").toUpperCase());
+  row("Active concurrent clients", `${r.activeClientsInput} → ${r.activeClients} (projected)`);
+  row("Peak RPM", `${r.rpmInput} → ${r.rpm} (projected)`);
+  row("Binary storage (TB)", `${r.binaryTBInput} → ${r.binaryTB} (projected)`);
+  row("Planned growth headroom (%)", r.growthPct);
+  row("Indexed artifacts (Xray)", r.xrayEnabled ? `${r.xrayArtifactsInput} → ${r.xrayArtifacts} (projected)` : "No Xray");
+  row("Local cache-fs", r.cacheFsGB > 0 ? `${r.cacheFsPct}% of binaries (${fmtGB(r.cacheFsGB)}/node)` : "Disabled");
+  row("High Availability", r.ha ? "Yes (multi-replica)" : "No (single replica)");
+  row("Ingress", r.externalLB ? `Load Balancer — ${r.lbDisplay}` : "JFrog NGINX (bundled)");
+  if (r.externalLB) row("LB routes to", r.provisionNginx ? "NGINX (kept behind LB)" : "Artifactory (no NGINX tier)");
+  row("NGINX tier provisioned", r.provisionNginx ? "Yes" : "No");
+  row("RabbitMQ", !r.xrayEnabled ? "N/A (no Xray)" : (r.externalRMQ ? "External" : "Bundled"));
+  row("Database", r.dbMode === "managed" ? "Managed (RDS/Cloud SQL/Flexible)" : "Self-hosted PostgreSQL");
+  const svcList = [];
+  if (r.svc.distribution) svcList.push("Distribution");
+  if (r.svc.jas) svcList.push("JAS");
+  if (r.svc.workers) svcList.push("Workers");
+  if (r.svc.appTrust) svcList.push("AppTrust + UnifiedPolicy");
+  if (r.svc.missionControl) svcList.push("Mission Control");
+  if (r.svc.curation) svcList.push("Curation + Catalog");
+  row("Optional services", svcList.join("; ") || "None");
+  if (r.svc.curation) row("Valkey", r.externalValkey ? "External" : "Co-located");
+  blank();
+
+  /* Totals (computed from components so it works for either page shape) */
+  const totalsOf = comps => comps.reduce((t, c) => ({
+    nodes: t.nodes + c.replicas, cpu: t.cpu + c.cpu * c.replicas,
+    mem: t.mem + c.memGB * c.replicas, disk: t.disk + c.diskGB * c.replicas
+  }), { nodes: 0, cpu: 0, mem: 0, disk: 0 });
+  const active = totalsOf(r.components);
+  const passive = r.passiveComponents ? totalsOf(r.passiveComponents) : null;
+
+  row("[AGGREGATE FOOTPRINT]");
+  row("Scope", "Nodes", "vCPU", "RAM (GB)", "Service disk (GB)");
+  if (isAP && passive) {
+    row("Active site", active.nodes, active.cpu, active.mem, active.disk);
+    row("Passive site", passive.nodes, passive.cpu, passive.mem, passive.disk);
+    row("Grand total", active.nodes + passive.nodes, active.cpu + passive.cpu, active.mem + passive.mem, active.disk + passive.disk);
+  } else {
+    row("Total", active.nodes, active.cpu, active.mem, active.disk);
+  }
+  row("Binary / artifact storage (TB)", isAP ? r.binaryTB * 2 : r.binaryTB);
+  blank();
+
+  /* Per-component sizing */
+  row("[PER-COMPONENT SIZING]");
+  row("Site", "Component", "Replicas", "vCPU (each)", "RAM GB (each)", "Disk GB (each)", "IOPS", "Instance / VM", "Total vCPU", "Total RAM (GB)", "Total disk (GB)", "Notes");
+  const compRows = (comps, site) => comps.forEach(c =>
+    row(site, c.name, c.replicas, c.cpu, c.memGB, c.diskGB, c.iops, c.instance, c.cpu * c.replicas, c.memGB * c.replicas, c.diskGB * c.replicas, c.note));
+  compRows(r.components, isAP ? "Active" : "—");
+  if (isAP && r.passiveComponents) compRows(r.passiveComponents, "Passive");
+  blank();
+
+  /* Kubernetes cluster plan */
+  if (r.deployment === "k8s") {
+    const managedDb = r.dbMode === "managed";
+    const planFor = comps => {
+      const workers = comps.filter(c => !(managedDb && c.name.startsWith("PostgreSQL")));
+      const pools = {};
+      workers.forEach(c => { (pools[c.instance] = pools[c.instance] || { cpu: c.cpu, memGB: c.memGB, count: 0 }).count += c.replicas; });
+      const nodes = Object.values(pools).reduce((s, p) => s + p.count, 0);
+      const cpu = Object.values(pools).reduce((s, p) => s + p.cpu * p.count, 0);
+      const mem = Object.values(pools).reduce((s, p) => s + p.memGB * p.count, 0);
+      return { pools, nodes, cpu, mem, clusterCpu: Math.ceil(cpu * 1.15), clusterMem: Math.ceil(mem * 1.15) };
+    };
+    row("[KUBERNETES CLUSTER PLAN]");
+    row("Site", "Node pool (VM)", "vCPU", "RAM (GB)", "Nodes");
+    const planSection = (comps, site) => {
+      const p = planFor(comps);
+      Object.entries(p.pools).sort((a, b) => b[1].count - a[1].count).forEach(([inst, info]) => row(site, inst, info.cpu, info.memGB, info.count));
+      row(site + " — total worker capacity", "", p.cpu, p.mem, p.nodes);
+      row(site + " — provision (incl. ~15% sys)", "", p.clusterCpu, p.clusterMem, "");
+    };
+    planSection(r.components, isAP ? "Active" : "Cluster");
+    if (isAP && r.passiveComponents) planSection(r.passiveComponents, "Passive");
+    blank();
+  }
+
+  /* Databases */
+  row("[DATABASES]");
+  row("Service", "Database", "User", "Mode");
+  const mode = r.dbMode === "managed" ? "Managed" : "Self-hosted";
+  row("Artifactory", "artifactory", "artifactory", mode);
+  if (r.xrayEnabled) row(`Xray${r.svc.jas ? " + JAS" : ""}`, "xraydb", "xray", mode);
+  if (r.svc.distribution) row("Distribution", "distribution", "distribution", mode);
+  if (r.svc.missionControl) row("Mission Control", "mission_control", "mission_control", mode);
+  if (r.svc.curation) row("Catalog (Curation)", "catalogdb", "catalog", mode);
+  blank();
+
+  /* External services (recommended, not in footprint) */
+  const ext = [];
+  if (r.xrayEnabled && r.externalRMQ && r.externalRmqSpec) {
+    const s = r.externalRmqSpec;
+    ext.push(["RabbitMQ", `${s.replicas} × ${s.instance}`, `${s.cpu} vCPU / ${s.memGB} GB`, fmtGB(s.diskGB)]);
+  }
+  if (r.svc.curation && r.externalValkey && r.externalValkeySpec) {
+    const v = r.externalValkeySpec;
+    ext.push(["Valkey", `${v.replicas} × ${v.instance}`, `${v.cpu} vCPU / ${v.memGB} GB`, fmtGB(v.diskGB)]);
+  }
+  if (ext.length) {
+    row("[EXTERNAL SERVICES — recommended, provisioned separately]");
+    row("Service", "Cluster", "Per-node spec", "Disk");
+    ext.forEach(e => row(...e));
+    blank();
+  }
+
+  return L.join("\r\n");
+}
+
+function downloadCsv(r) {
+  if (!r) return;
+  const blob = new Blob([buildSizingCsv(r)], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `jpd-sizing-${r.cloud}-${r.tier}-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}

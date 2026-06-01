@@ -186,6 +186,7 @@
     </div>
 
     <button class="calc" id="calcBtn">Calculate sizing</button>
+    <button class="export" id="exportBtn">⤓ Export to CSV</button>
   </div>
 
   <!-- OUTPUT PANEL -->
@@ -555,7 +556,10 @@ function calculate() {
 
 /* ---------- Render ---------- */
 
+let lastResult = null; // most recent render() input, for CSV export
+
 function render(r) {
+  lastResult = r;
   const deployLabel = r.deployment === "k8s" ? "Kubernetes" : "Virtual Machines";
   const tierName    = TIER_LABEL[r.tier];
   const isAP        = r.topology === "active-passive";
@@ -1041,6 +1045,7 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
 /* ---------- Wire up ---------- */
 
 document.getElementById("calcBtn").addEventListener("click", calculate);
+document.getElementById("exportBtn").addEventListener("click", () => downloadCsv(lastResult));
 document.getElementById("inputs").addEventListener("change", calculate);
 document.getElementById("inputs").addEventListener("input", (e) => {
   if (e.target.type === "number") calculate();
