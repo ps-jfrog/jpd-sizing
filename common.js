@@ -290,6 +290,39 @@ const STORAGE_CLASS = {
   onprem: { block:"Enterprise NVMe SSD (≥3K IOPS)",  premium:"All-flash SAN",          object:"S3-compatible (MinIO / Ceph / NetApp StorageGRID)" }
 };
 
+// JFrog-recommended binary store (Artifactory filestore) per cloud: the preferred
+// option plus alternatives, with the binarystore.xml template each maps to.
+const BINARY_STORE = {
+  aws: {
+    best: { name:"Amazon S3", template:"s3-storage-v3 (cluster-s3-storage-v3 for HA)", note:"JFrog-recommended binary store — virtually unlimited, lifecycle tiering, lowest $/TB at scale. Front it with the local cache-fs." },
+    alternatives: [
+      { name:"Amazon EFS", template:"cluster-file-system", note:"Shared NFS across HA nodes — simpler, but higher latency and cost than S3 at scale." },
+      { name:"Amazon EBS + file system", template:"file-system", note:"Block disk on a single node — only for non-HA / small deployments." }
+    ]
+  },
+  azure: {
+    best: { name:"Azure Blob Storage", template:"azure-blob-storage (cluster variant for HA)", note:"JFrog-recommended binary store on Azure — Hot/Cool tiering, scales independently of compute. Front it with the local cache-fs." },
+    alternatives: [
+      { name:"Azure Files (NFS)", template:"cluster-file-system", note:"Shared NFS across HA nodes — simpler, but higher latency/cost at scale." },
+      { name:"Azure Managed Disk + file system", template:"file-system", note:"Block disk on a single node — only for non-HA / small deployments." }
+    ]
+  },
+  gcp: {
+    best: { name:"Google Cloud Storage", template:"google-storage-v2 (cluster variant for HA)", note:"JFrog-recommended binary store on GCP — object lifecycle management, scales independently of compute. Front it with the local cache-fs." },
+    alternatives: [
+      { name:"Filestore (NFS)", template:"cluster-file-system", note:"Shared NFS across HA nodes — simpler, but higher latency/cost at scale." },
+      { name:"pd-ssd + file system", template:"file-system", note:"Block disk on a single node — only for non-HA / small deployments." }
+    ]
+  },
+  onprem: {
+    best: { name:"S3-compatible object storage (MinIO / Ceph RGW / NetApp StorageGRID)", template:"s3-storage-v3 (cluster variant for HA)", note:"Recommended for scale & HA — any S3-compatible store works. Front it with the local cache-fs." },
+    alternatives: [
+      { name:"Shared NFS", template:"cluster-file-system", note:"Common on-prem choice for HA when no object store is available." },
+      { name:"Local file system", template:"file-system", note:"Single node only — non-HA / small deployments." }
+    ]
+  }
+};
+
 const NETWORK_REC = {
   aws:    "≥ 10 Gbps ENA, Placement Group (cluster) for HA replicas, PrivateLink for managed services.",
   azure:  "Accelerated Networking, ≥ 10 Gbps, Availability Zones for HA.",
@@ -384,6 +417,16 @@ function buildSizingCsv(r) {
   }
   row("Binary / artifact storage (TB)", isAP ? r.binaryTB * 2 : r.binaryTB);
   blank();
+
+  /* Binary store recommendation (JFrog-preferred filestore for the cloud) */
+  const bs = BINARY_STORE[r.cloud];
+  if (bs) {
+    row(`[BINARY STORE — JFrog recommended for ${r.cloudLabel}]`);
+    row("Option", "Recommended", "binarystore.xml template", "Notes");
+    row(bs.best.name, "Yes (best)", bs.best.template, bs.best.note);
+    bs.alternatives.forEach(a => row(a.name, "No", a.template, a.note));
+    blank();
+  }
 
   /* Per-component sizing */
   row("[PER-COMPONENT SIZING]");
