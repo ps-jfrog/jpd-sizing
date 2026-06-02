@@ -1336,6 +1336,79 @@ function calculate() {
   });
 }
 
+/* =============================================================================
+   Ports & connectivity — the network ports that must be reachable between the
+   deployed components. Deployment-aware: inter-node firewall rules for VMs,
+   ingress/egress + intra-cluster guidance for Kubernetes. Conditioned on which
+   components (Xray, RabbitMQ, Valkey, Distribution, external services) are in play.
+   ============================================================================= */
+function buildPortsPanel(r) {
+  const xray        = r.xrayEnabled;
+  const rmqBundled  = !r.externalRMQ && (r.xrayEnabled || r.svc.distribution || r.svc.workers);
+  const rmqInPlay   = r.xrayEnabled || r.svc.distribution || r.svc.workers;
+  const externalDb  = r.dbMode === "external";
+
+  const rows = [];
+  const row = (ports, proto, flow, purpose) =>
+    rows.push(`<tr><td><code>${ports}</code></td><td>${proto}</td><td>${flow}</td><td><span class="hint">${purpose}</span></td></tr>`);
+
+  let intro, notes = [];
+
+  if (r.deployment === "vm") {
+    intro = "Open these ports in your security groups / host firewalls so the VMs can talk to each other and to clients. Ports not listed are bound to localhost on each node.";
+    row("443, 80", "TCP / HTTPS", `Clients &amp; CI → ${r.externalLB ? r.lbDisplay : "Nginx"}`, "Console UI, REST API, Docker/registry, package clients (TLS on 443).");
+    row("8082", "TCP / HTTP", `${r.externalLB ? r.lbDisplay : "Nginx"} → Artifactory`, "JFrog Router — primary upstream for all platform APIs and the UI.");
+    row("8081", "TCP / HTTP", `${r.externalLB ? "LB" : "Nginx"} → Artifactory`, "Artifactory service (direct/legacy API path).");
+    if (r.ha) row("8081, 8082, 8040", "TCP", "Artifactory ↔ Artifactory (HA replicas)", "HA inter-node: Artifactory, Router, and Access (gRPC) between replicas.");
+    row("5432", "TCP", `Platform nodes → ${externalDb ? "external PostgreSQL" : "co-located PostgreSQL"}`, `PostgreSQL — Artifactory${xray ? ", Xray" : ""}${r.svc.distribution ? ", Distribution" : ""}${r.svc.curation ? ", Catalog" : ""} database(s).`);
+    if (xray) {
+      row("8082", "TCP / HTTP", "Xray ↔ Artifactory (Router)", "Xray indexing pulls + Artifactory → Xray scan/curation requests.");
+      row("8000", "TCP / HTTP", "Xray ↔ Xray (internal services)", "Xray server / analysis / indexer / persist microservices.");
+    }
+    if (rmqInPlay) {
+      row("5672, 5671", "TCP / AMQP(S)", `Xray${r.svc.distribution ? " / Distribution" : ""}${r.svc.workers ? " / Workers" : ""} → ${r.externalRMQ ? "external RabbitMQ" : "RabbitMQ"}`, "Platform message bus (5671 = AMQPS/TLS).");
+      if (rmqBundled && r.ha) row("25672, 4369", "TCP", "RabbitMQ ↔ RabbitMQ (cluster)", "Erlang inter-node clustering + epmd. 15672 = management UI/API (optional).");
+      if (r.externalRMQ)       row("15672", "TCP / HTTP", "Xray → external RabbitMQ (mgmt)", "Management REST API — Xray uses it to create/inspect queues.");
+    }
+    if (r.svc.curation) {
+      row("6379, 6380", "TCP", `Catalog → ${r.externalValkey ? "external Valkey" : "Valkey"}`, "Curation/Catalog cache (6380 = TLS).");
+      if (r.externalValkey && r.ha) row("26379, 16379", "TCP", "Valkey ↔ Valkey (Sentinel / cluster)", "Sentinel quorum + cluster bus (external HA Valkey).");
+    }
+    if (r.svc.distribution) row("8082", "TCP / HTTP", "Distribution ↔ Artifactory (Router)", "Release-bundle distribution APIs.");
+    notes.push("Internal JFrog microservices (Access, Metadata, Frontend, Observability, Event — typically <code>8040–8049</code>, <code>8070</code>, <code>8086</code>) bind to each node and need no cross-node rule; only Artifactory HA replicas open <code>8081/8082/8040</code> between themselves.");
+    if (r.externalLB) notes.push(`The ${r.lbDisplay} health-checks and forwards to Artifactory on <code>8082</code> (or <code>8081</code>).`);
+    if (r.topology === "active-passive") notes.push("Active+Passive: also allow cross-site replication — the active Artifactory reaches the passive over <code>443/8082</code> (federation/replication), plus your chosen DB replication path.");
+  } else {
+    intro = "Inside the cluster, pod-to-pod service traffic is handled by the CNI — you only need explicit rules for external ingress and for egress to any external services. The intra-cluster ports are listed for writing NetworkPolicies.";
+    row("443, 80", "TCP / HTTPS", "Clients &amp; CI → Ingress / LoadBalancer Service", "External entry (Ingress controller or cloud LB Service; TLS on 443).");
+    row("30000–32767", "TCP", "Clients → Nodes (NodePort only)", "NodePort service range — only if you expose via NodePort instead of Ingress/LB.");
+    if (externalDb)        row("5432", "TCP (egress)", "Cluster pods → external PostgreSQL", "Allow cluster egress to your managed/standalone DB.");
+    if (r.externalRMQ)     row("5672, 5671, 15672", "TCP (egress)", "Cluster pods → external RabbitMQ", "AMQP(S) + management REST API.");
+    if (r.svc.curation && r.externalValkey) row("6379, 6380", "TCP (egress)", "Cluster pods → external Valkey", "Cache (TLS on 6380).");
+    const intra = ["Router <code>8082</code>", "Artifactory <code>8081</code>", "Access <code>8040</code>"];
+    if (xray) intra.push("Xray <code>8000</code>");
+    if (rmqBundled) intra.push("RabbitMQ <code>5672</code>");
+    if (!externalDb) intra.push("PostgreSQL <code>5432</code>");
+    if (r.svc.curation && !r.externalValkey) intra.push("Valkey <code>6379</code>");
+    notes.push(`Intra-cluster (pod-to-pod, CNI-handled; allow these in NetworkPolicies if enforced): ${intra.join(" · ")}.`);
+    notes.push("Standard cluster ports (kube-apiserver <code>6443</code>, kubelet <code>10250</code>, etcd <code>2379–2380</code>, NodePort <code>30000–32767</code>) are part of your Kubernetes setup, not JFrog-specific.");
+    if (r.topology === "active-passive") notes.push("Active+Passive: open cross-cluster ingress on <code>443</code> between sites for federation/replication.");
+  }
+
+  return `
+    <div class="panel">
+      <h2>Ports &amp; connectivity — ${r.deployment === "k8s" ? "Kubernetes" : "Virtual Machines"}</h2>
+      <p style="margin:0 0 10px; font-size:13px; color:var(--muted);">${intro}</p>
+      <table>
+        <thead><tr><th>Port(s)</th><th>Protocol</th><th>From → To</th><th>Purpose</th></tr></thead>
+        <tbody>${rows.join("")}</tbody>
+      </table>
+      ${notes.map(n => `<div class="hint" style="margin-top:8px;">${n}</div>`).join("")}
+      <div class="hint" style="margin-top:8px;">Defaults shown; ports are configurable in <code>system.yaml</code>. Reference: <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/open-ports" target="_blank">JFrog — Network Ports</a>.</div>
+    </div>
+  `;
+}
+
 /* ---------- Render ---------- */
 
 let lastResult = null; // most recent render() input, for CSV export
@@ -1678,6 +1751,9 @@ function render(r) {
       </table>
     </div>
   `;
+
+  /* Ports & connectivity */
+  html += buildPortsPanel(r);
 
   /* Database setup — required databases, users & configuration (always external here) */
   {
