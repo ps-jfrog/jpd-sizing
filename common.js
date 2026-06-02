@@ -1,8 +1,8 @@
 /* =============================================================================
-   Shared code for index.html and ha-index.html.
+   The JPD Sizing Calculator application + shared data for index.html.
    Loaded as a CLASSIC script (no module/import) so it works over file:// too.
-   Contains: JFrog reference data, tier helpers, and fmtGB().
-   Each page keeps its own calculate()/render().
+   Contains: JFrog reference data, tier helpers, fmtGB(), the CSV exporter, the
+   Helm/Ansible artifact generators, and calculate()/render() + UI wiring.
    ============================================================================= */
 
 /* =========================================================================
@@ -344,8 +344,8 @@ function fmtGB(n) {
 
 /* =============================================================================
    CSV export. buildSizingCsv(r) serializes a render() result object into a
-   multi-section CSV. It introspects r, so it works for both the single-cluster
-   page (index.html) and the Active+Passive page (ha-index.html).
+   multi-section CSV. It introspects r, so it works for both single-cluster and
+   Active+Passive results.
    ============================================================================= */
 
 function csvEscape(v) {
@@ -386,7 +386,7 @@ function buildSizingCsv(r) {
   if (r.externalLB) row("LB routes to", r.provisionNginx ? "NGINX (kept behind LB)" : "Artifactory (no NGINX tier)");
   row("NGINX tier provisioned", r.provisionNginx ? "Yes" : "No");
   row("RabbitMQ", !r.xrayEnabled ? "N/A (no Xray)" : (r.externalRMQ ? "External" : "Bundled"));
-  row("Database", r.dbMode === "managed" ? "Managed (RDS/Cloud SQL/Flexible)" : "Self-hosted PostgreSQL");
+  row("Database", r.dbMode === "external" ? "External (managed/standalone RDBMS)" : "Co-located (provisioned with the deployment)");
   const svcList = [];
   if (r.svc.distribution) svcList.push("Distribution");
   if (r.svc.jas) svcList.push("JAS");
@@ -439,9 +439,9 @@ function buildSizingCsv(r) {
 
   /* Kubernetes cluster plan */
   if (r.deployment === "k8s") {
-    const managedDb = r.dbMode === "managed";
+    const externalDb = r.dbMode === "external";
     const planFor = comps => {
-      const workers = comps.filter(c => !(managedDb && c.name.startsWith("PostgreSQL")));
+      const workers = comps.filter(c => !(externalDb && c.name.startsWith("PostgreSQL")));
       const pools = {};
       workers.forEach(c => { (pools[c.instance] = pools[c.instance] || { cpu: c.cpu, memGB: c.memGB, count: 0 }).count += c.replicas; });
       const nodes = Object.values(pools).reduce((s, p) => s + p.count, 0);
@@ -465,7 +465,7 @@ function buildSizingCsv(r) {
   /* Databases */
   row("[DATABASES]");
   row("Service", "Database", "User", "Mode");
-  const mode = r.dbMode === "managed" ? "Managed" : "Self-hosted";
+  const mode = r.dbMode === "external" ? "External" : "Co-located";
   row("Artifactory", "artifactory", "artifactory", mode);
   if (r.xrayEnabled) row(`Xray${r.svc.jas ? " + JAS" : ""}`, "xraydb", "xray", mode);
   if (r.svc.distribution) row("Distribution", "distribution", "distribution", mode);
@@ -493,15 +493,1362 @@ function buildSizingCsv(r) {
   return L.join("\r\n");
 }
 
-function downloadCsv(r) {
-  if (!r) return;
-  const blob = new Blob([buildSizingCsv(r)], { type: "text/csv;charset=utf-8;" });
+function downloadText(filename, content, mime) {
+  const blob = new Blob([content], { type: (mime || "text/plain") + ";charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `jpd-sizing-${r.cloud}-${r.tier}-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.download = filename;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+function downloadCsv(r) {
+  if (!r) return;
+  downloadText(`jpd-sizing-${r.cloud}-${r.tier}-${new Date().toISOString().slice(0, 10)}.csv`, buildSizingCsv(r), "text/csv");
+}
+
+/* =============================================================================
+   Deployment artifacts. From the sizing result, generate a Helm values.yaml for
+   the jfrog/jfrog-platform chart (Kubernetes) or an Ansible bundle (VMs). These
+   are sizing-derived STARTING templates — validate against your chart/installer
+   version. Secrets are placeholders.
+   ============================================================================= */
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function findComp(r, name) {
+  return r.components.find(c => c.name === name) || null;
+}
+
+// Per-cloud external binarystore block (jfrog-platform persistence.* under artifactory).
+function binarystoreLines(r, indent) {
+  const I = indent, I2 = indent + "  ";
+  const out = [];
+  if (r.cloud === "azure") {
+    out.push(I + "type: azure-blob-storage");
+    out.push(I + "azureBlob:");
+    out.push(I2 + 'accountName: "<storage-account>"');
+    out.push(I2 + 'accountKey: "<account-key>"');
+    out.push(I2 + 'containerName: "<container>"');
+    out.push(I2 + 'endpoint: "https://<storage-account>.blob.core.windows.net"');
+  } else if (r.cloud === "gcp") {
+    out.push(I + "type: google-storage-v2");
+    out.push(I + "googleStorage:");
+    out.push(I2 + "useInstanceCredentials: true   # GKE Workload Identity (HMAC identity/credential is deprecated)");
+    out.push(I2 + 'bucketName: "<gcs-bucket>"');
+    out.push(I2 + 'path: "artifactory/filestore"');
+    out.push(I2 + 'endpoint: "commondatastorage.googleapis.com"');
+  } else if (r.cloud === "onprem") {
+    out.push(I + "type: s3-storage-v3-direct   # S3-compatible (MinIO / Ceph / StorageGRID)");
+    out.push(I + "awsS3V3:");
+    out.push(I2 + "testConnection: false");
+    out.push(I2 + "useInstanceCredentials: false");
+    out.push(I2 + 'identity: "<access-key>"');
+    out.push(I2 + 'credential: "<secret-key>"');
+    out.push(I2 + 'region: "<region>"');
+    out.push(I2 + 'bucketName: "<bucket>"');
+    out.push(I2 + 'path: "artifactory/filestore"');
+    out.push(I2 + 'endpoint: "http://<minio-host>:9000"');
+    out.push(I2 + "useHttp: true");
+    out.push(I2 + "enablePathStyleAccess: true");
+  } else { // aws
+    out.push(I + "type: s3-storage-v3-direct");
+    out.push(I + "awsS3V3:");
+    out.push(I2 + "testConnection: false");
+    out.push(I2 + "useInstanceCredentials: true   # or set identity/credential");
+    out.push(I2 + 'region: "<aws-region>"');
+    out.push(I2 + 'bucketName: "<s3-bucket>"');
+    out.push(I2 + 'path: "artifactory/filestore"');
+  }
+  return out;
+}
+
+function buildHelmValues(r) {
+  const arti    = findComp(r, "Artifactory");
+  const xray    = findComp(r, "Xray");
+  const nginx   = findComp(r, "Nginx (reverse proxy / TLS)");
+  const catalog = findComp(r, "Catalog");
+  const artiDb  = findComp(r, "PostgreSQL (Artifactory DB)");
+
+  const external       = r.dbMode === "external";   // external PG + object-store binarystore
+  const catalogOn      = r.svc.curation;
+  const distributionOn = r.svc.distribution;
+  const valkeyBundled  = catalogOn && !r.externalValkey;
+  const rmqBundled     = !r.externalRMQ && (r.xrayEnabled || r.svc.distribution || r.svc.workers);
+  const jasOn          = r.svc.jas && r.xrayEnabled;
+
+  const pgDisk   = r.components.filter(c => c.name.startsWith("PostgreSQL")).reduce((s, c) => s + c.diskGB, 0) || 20;
+  const maxConns = Math.max(300, r.artiDbMaxConns + (r.xrayEnabled ? r.xrayDbMaxConns : 0));
+
+  const L = [];
+  const p = s => L.push(s);
+  const res = (indent, cpu, mem) => {
+    p(indent + "resources:");
+    p(indent + "  requests:");
+    p(indent + '    cpu: "' + cpu + '"');
+    p(indent + '    memory: "' + mem + 'Gi"');
+    p(indent + "  limits:");
+    p(indent + '    cpu: "' + cpu + '"');
+    p(indent + '    memory: "' + mem + 'Gi"');
+  };
+
+  p("# JFrog Platform — Helm values for the jfrog/jfrog-platform chart.");
+  p("# Generated by the JPD Sizing Calculator, modeled on the reference values in jf-k8s/:");
+  p("#   helm-values-k8s.yaml (self-contained)  &  helm-values-k8s-external.yaml (external).");
+  p("# MODE: " + (external
+    ? "EXTERNAL — external PostgreSQL + object-store binarystore (Database input = Managed)."
+    : "SELF-CONTAINED — bundled PostgreSQL + filesystem binarystore (Database input = Self-hosted)."));
+  p("# Per-service podSecurityContext/containerSecurityContext (runAsUser 1030/1035/104/1001) are");
+  p("#   OMITTED for brevity — copy them from the reference files for PodSecurity-restricted clusters.");
+  p("# Secrets are placeholders; resources are the sizing-derived per-pod capacity (Guaranteed QoS).");
+  p("# Validate keys against your chart version: helm show values jfrog/jfrog-platform");
+  p("");
+  p("global:");
+  p("  masterKeySecretName: jfrog-master-key");
+  p("  joinKeySecretName: jfrog-join-key");
+  if (external) { p("  database:"); p("    initDBCreation: false"); }
+  if (catalogOn) {
+    p("  valkey:");
+    if (valkeyBundled) {
+      p('    password: "<valkey-password>"            # consumed by the Catalog cache');
+    } else {
+      p('    host: "<valkey-host>"                    # EXTERNAL Valkey (not in the reference files)');
+      p("    port: 6379");
+      p('    password: "<valkey-password>"');
+    }
+  }
+  p("  security:");
+  p("    runAsNonRoot: true");
+  p("    allowPrivilegeEscalation: false");
+  p("    seccompProfile: { type: RuntimeDefault }");
+  p("    capabilities: { drop: [ALL] }");
+  p("");
+  p("shared:");
+  p("  metrics:");
+  p("    enabled: false");
+  p("");
+
+  /* Artifactory */
+  p("artifactory:");
+  p("  enabled: true");
+  p("  replicaCount: " + (arti ? arti.replicas : 1) + (r.ha ? "   # HA" : ""));
+  p("  serviceAccount: { create: false, name: jfrog-sa }");
+  p("  rbac: { create: false }");
+  if (external) {
+    p("  postgresql:");
+    p("    enabled: false");
+    p("  database:");
+    p("    type: postgresql");
+    p("    driver: org.postgresql.Driver");
+    p('    url: "jdbc:postgresql://<db-host>:5432/artifactory"');
+    p('    user: "artifactory"');
+    p('    password: "<db-password>"');
+  }
+  p("  artifactory:");
+  const hasArtiExtra = catalogOn || r.svc.appTrust || jasOn || r.svc.workers || r.externalRMQ;
+  p("    extraSystemYaml:" + (hasArtiExtra ? "" : " {}"));
+  if (catalogOn) {
+    p("      artifactory:");
+    p("        curation:");
+    p("          enabled: true");
+    p("      metadata:");
+    p("        catalog:");
+    p("          enabled: true");
+  }
+  if (r.svc.appTrust) { p("      apptrust:"); p("        enabled: true"); }
+  if (jasOn)          { p("      jas:");      p("        enabled: true"); }
+  if (r.svc.workers || r.externalRMQ) {
+    p("      shared:");
+    if (r.svc.workers) {
+      p('        extraJavaOpts: "-Dartifactory.workers.addon.support=true"');
+      p("        featureToggler:");
+      p("          worker: true");
+    }
+    if (r.externalRMQ) {
+      p("        rabbitMq:");
+      p("          active: false                      # EXTERNAL RabbitMQ (not in the reference files)");
+      p('          url: "amqp://<rmq-host>:5672"');
+    }
+  }
+  if (r.svc.workers) { p("      access:"); p("        worker:"); p("          enabled: true"); }
+  res("    ", arti ? arti.cpu : 8, arti ? arti.memGB : 32);
+  p("    javaOpts:");
+  p('      xms: "' + Math.max(1, Math.floor((arti ? arti.memGB : 32) / 4)) + 'g"');
+  p('      xmx: "' + Math.max(2, Math.floor((arti ? arti.memGB : 32) / 2)) + 'g"');
+  p("    persistence:");
+  p("      enabled: true");
+  p("      size: " + (external ? Math.max(20, r.cacheFsGB || 20) : (arti ? arti.diskGB : 50)) + "Gi");
+  p("      accessMode: ReadWriteOnce");
+  if (external) {
+    binarystoreLines(r, "      ").forEach(p);
+  } else {
+    p("      # Self-contained: filesystem PVC (per helm-values-k8s.yaml). For the recommended");
+    p("      # object store (" + BINARY_STORE[r.cloud].best.name + "), use external mode.");
+  }
+  p("  nginx:");
+  p("    enabled: " + (r.provisionNginx ? "true" : "false   # external load balancer fronts the platform"));
+  if (r.provisionNginx) {
+    p("    replicaCount: " + (nginx ? nginx.replicas : 1));
+    p("    service: { type: ClusterIP }");
+    res("    ", nginx ? nginx.cpu : 4, nginx ? nginx.memGB : 8);
+  }
+  if (r.svc.appTrust) { p("  apptrust:"); p("    enabled: true"); p("  unifiedpolicy:"); p("    enabled: true"); }
+  p("  mc:");
+  p("    enabled: " + (r.svc.missionControl ? "true" : "false"));
+  p("  livenessProbe:  { initialDelaySeconds: 300, periodSeconds: 20, failureThreshold: 10 }");
+  p("  readinessProbe: { initialDelaySeconds: 120, periodSeconds: 15, failureThreshold: 20 }");
+  p("");
+
+  p("jfconnect:");
+  p("  enabled: true");
+  p("");
+
+  /* Xray */
+  if (r.xrayEnabled) {
+    p("xray:");
+    p("  enabled: true");
+    p("  replicaCount: " + (xray ? xray.replicas : 1));
+    p("  serviceAccount: { create: false, name: jfrog-sa }");
+    p("  rbac: { create: false }");
+    if (external) {
+      p("  postgresql:");
+      p("    enabled: false");
+      p("  database:");
+      p('    type: postgres');
+      p('    url: "postgres://<db-host>:5432/xraydb?sslmode=disable"');
+      p('    user: "xray"');
+      p('    password: "<db-password>"');
+    }
+    p("  xray:");
+    p("    extraSystemYaml:" + ((catalogOn || jasOn) ? "" : " {}"));
+    if (catalogOn) { p("      curation:"); p("        enabled: true"); p("      catalog:"); p("        enabled: true"); }
+    if (jasOn)     { p("      jas:");      p("        enabled: true"); }
+    res("  ", xray ? xray.cpu : 8, xray ? xray.memGB : 16);
+    p("  persistence:");
+    p("    enabled: true");
+    p("    size: 10Gi");
+    p("  valkey:");
+    if (valkeyBundled) {
+      p("    enabled: true");
+      res("    ", 1, 2);
+    } else if (catalogOn) {
+      p("    enabled: false   # EXTERNAL Valkey — see global.valkey above");
+    } else {
+      p("    enabled: false");
+    }
+    p("");
+  } else {
+    p("xray:");
+    p("  enabled: false");
+    p("");
+  }
+
+  /* Catalog (Curation) */
+  if (catalogOn) {
+    p("catalog:");
+    p("  enabled: true");
+    p("  replicaCount: " + (catalog ? catalog.replicas : 1));
+    p("  serviceAccount: { create: false, name: jfrog-sa }");
+    p("  rbac: { create: false }");
+    p("  cache:");
+    p("    enabled: true");
+    if (external) {
+      p("  database:");
+      p('    url: "jdbc:postgresql://<db-host>:5432/catalog?sslmode=disable"');
+      p('    user: "catalog"');
+      p('    password: "<db-password>"');
+    }
+    res("  ", catalog ? catalog.cpu : 8, catalog ? catalog.memGB : 16);
+    p("  persistence:");
+    p("    enabled: true");
+    p("    size: 10Gi");
+    p("");
+  } else {
+    p("catalog:");
+    p("  enabled: false");
+    p("");
+  }
+
+  /* Distribution */
+  if (distributionOn) {
+    p("distribution:");
+    p("  enabled: true");
+    p("  replicaCount: " + (r.ha ? 2 : 1));
+    p("  serviceAccount: { create: false, name: jfrog-sa }");
+    p("  rbac: { create: false }");
+    if (external) {
+      p("  database:");
+      p('    url: "jdbc:postgresql://<db-host>:5432/distribution?sslmode=disable"');
+      p('    user: "distribution"');
+      p('    password: "<db-password>"');
+    }
+    res("  ", 1, 2);
+    p("  persistence:");
+    p("    enabled: true");
+    p("    size: 10Gi");
+    p("");
+  } else {
+    p("distribution:");
+    p("  enabled: false");
+    p("");
+  }
+
+  /* RabbitMQ */
+  p("rabbitmq:");
+  p("  enabled: " + (rmqBundled ? "true" : "false" + (r.externalRMQ ? "   # EXTERNAL RabbitMQ — wired via extraSystemYaml shared.rabbitMq above" : "")));
+  if (rmqBundled) {
+    p("  replicaCount: " + (r.ha ? 3 : 1));
+    p("  rabbitmqUpgradeReady: true");
+    p("  auth:");
+    p("    existingPasswordSecret: jfrog-rabbitmq-secret");
+    p("    existingErlangSecret: jfrog-rabbitmq-erlang-secret");
+    p("  persistence: { size: 20Gi }");
+    res("  ", 2, 4);
+  }
+  p("");
+
+  /* PostgreSQL (bundled only in self-contained mode) */
+  p("databaseUpgradeReady: true");
+  p("postgresql:");
+  if (external) {
+    p("  enabled: false   # external database in use");
+  } else {
+    p("  enabled: true");
+    p("  image:");
+    p("    tag: 17.6.0-debian-12-r2");
+    p("  primary:");
+    p("    extendedConfiguration: |");
+    p("      max_connections = " + maxConns);
+    p("    persistence: { size: " + pgDisk + "Gi }");
+    res("    ", artiDb ? Math.min(artiDb.cpu, 8) : 2, artiDb ? Math.min(artiDb.memGB, 16) : 4);
+  }
+  p("");
+  p("# Deprecated / unused — explicitly disabled");
+  p("pipelines: { enabled: false }");
+  p("insight:   { enabled: false }");
+  p("mc:        { enabled: false }   # standalone MC deprecated; use artifactory.mc above");
+
+  return L.join("\n");
+}
+
+function buildAnsibleInventory(r) {
+  const arti  = findComp(r, "Artifactory");
+  const nginx = findComp(r, "Nginx (reverse proxy / TLS)");
+  const xray  = findComp(r, "Xray");
+  const rmq   = findComp(r, "RabbitMQ (Xray)");
+  const L = [];
+  const group = (name, comp, n) => {
+    if (!n) return;
+    L.push("[" + name + "]" + (comp ? "   # " + comp.cpu + " vCPU / " + comp.memGB + " GB each" : ""));
+    for (let i = 1; i <= n; i++) L.push(name + "-" + i + " ansible_host=<ip-" + i + ">");
+    L.push("");
+  };
+  group("artifactory", arti, arti ? arti.replicas : 1);
+  if (r.provisionNginx && nginx) group("nginx", nginx, nginx.replicas);
+  if (r.xrayEnabled && xray)     group("xray", xray, xray.replicas);
+  if (r.xrayEnabled && !r.externalRMQ && rmq) group("rabbitmq", rmq, rmq.replicas);
+  if (r.dbMode === "colocated")       group("postgresql", null, r.ha ? 2 : 1);
+  L.push("[jpd:children]");
+  L.push("artifactory");
+  if (r.provisionNginx) L.push("nginx");
+  if (r.xrayEnabled) L.push("xray");
+  return L.join("\n");
+}
+
+function buildSystemYamlTemplate(r) {
+  const L = [];
+  L.push("# system.yaml.j2 — rendered onto each node by the playbook.");
+  L.push("configVersion: 1");
+  L.push("shared:");
+  L.push('  jfrogUrl: "https://<jpd-url>"');
+  L.push("  security:");
+  L.push('    masterKey: "{{ jpd_master_key }}"');
+  L.push('    joinKey: "{{ jpd_join_key }}"');
+  if (r.ha) {
+    L.push("  node:");
+    L.push("    id: \"{{ inventory_hostname }}\"");
+    L.push("    primary: \"{{ 'true' if inventory_hostname == groups['artifactory'][0] else 'false' }}\"");
+    L.push("    haEnabled: true");
+  }
+  L.push("  database:");
+  L.push("    type: postgresql");
+  L.push("    driver: org.postgresql.Driver");
+  L.push('    url: "jdbc:postgresql://{{ db_host }}:5432/artifactory"');
+  L.push('    username: artifactory');
+  L.push('    password: "{{ artifactory_db_password }}"');
+  if (r.xrayEnabled && r.externalRMQ) {
+    L.push("  rabbitMq:");
+    L.push("    active: false   # external RabbitMQ");
+    L.push('    url: "amqp://{{ rmq_host }}:5672"');
+  }
+  return L.join("\n");
+}
+
+function buildAnsiblePlaybook(r) {
+  const L = [];
+  L.push("# site.yml — install JFrog Artifactory" + (r.xrayEnabled ? " + Xray" : "") + " on VMs.");
+  L.push("# Follows the JFrog manual install (Linux archive + system.yaml). Adapt versions/paths.");
+  L.push("- name: Install JFrog Artifactory");
+  L.push("  hosts: artifactory");
+  L.push("  become: true");
+  L.push("  vars:");
+  L.push('    artifactory_version: "7.x.x"          # pin to your target release');
+  L.push('    install_root: /opt/jfrog/artifactory');
+  L.push('    db_host: "<db-host>"');
+  L.push('    # secrets: pass via --extra-vars or Ansible Vault');
+  L.push("  tasks:");
+  L.push("    - name: Create install directory");
+  L.push("      ansible.builtin.file: { path: '{{ install_root }}', state: directory }");
+  L.push("    - name: Download & unpack Artifactory Pro (bundled JRE)");
+  L.push("      ansible.builtin.unarchive:");
+  L.push('        src: "https://releases.jfrog.io/artifactory/artifactory-pro/org/artifactory/pro/jfrog-artifactory-pro/{{ artifactory_version }}/jfrog-artifactory-pro-{{ artifactory_version }}-linux.tar.gz"');
+  L.push("        dest: '{{ install_root }}'");
+  L.push("        remote_src: true");
+  L.push("        extra_opts: [--strip-components=1]");
+  L.push("    - name: Render system.yaml (external DB" + (r.ha ? ", HA node config" : "") + ")");
+  L.push("      ansible.builtin.template:");
+  L.push("        src: templates/system.yaml.j2");
+  L.push("        dest: '{{ install_root }}/var/etc/system.yaml'");
+  L.push("    - name: Install & start the service");
+  L.push("      ansible.builtin.shell: |");
+  L.push("        {{ install_root }}/app/bin/installService.sh");
+  L.push("        systemctl enable --now artifactory");
+  if (r.provisionNginx) {
+    L.push("");
+    L.push("- name: Install Nginx reverse proxy");
+    L.push("  hosts: nginx");
+    L.push("  become: true");
+    L.push("  tasks:");
+    L.push("    - name: Install nginx + JFrog reverse-proxy config");
+    L.push("      ansible.builtin.debug: { msg: 'Install nginx and drop in the Artifactory reverse-proxy conf (Artifactory UI generates it).' }");
+  }
+  if (r.xrayEnabled) {
+    L.push("");
+    L.push("- name: Install JFrog Xray");
+    L.push("  hosts: xray");
+    L.push("  become: true");
+    L.push("  vars: { xray_version: \"3.x.x\", db_host: \"<db-host>\" }");
+    L.push("  tasks:");
+    L.push("    - name: Download & unpack Xray, render its system.yaml, install service");
+    L.push("      ansible.builtin.debug: { msg: 'Mirror the Artifactory tasks using the Xray archive; point system.yaml at xraydb" + (r.externalRMQ ? " and the external RabbitMQ" : "") + ".' }");
+  }
+  return L.join("\n");
+}
+
+function buildArtifactPanel(r) {
+  if (r.deployment === "k8s") {
+    const values = buildHelmValues(r);
+    const cmds = "helm repo add jfrog https://charts.jfrog.io\n" +
+                 "helm repo update\n" +
+                 "kubectl create namespace jfrog\n" +
+                 "helm upgrade --install jfrog jfrog/jfrog-platform -n jfrog -f values.yaml";
+    return `
+    <details class="panel">
+      <summary style="font-size:14px;">Deployment artifacts — Kubernetes (Helm)</summary>
+      <p style="margin:10px 0 4px; font-size:13px; color:var(--muted);">Deploy with the unified <code>jfrog/jfrog-platform</code> chart (structure mirrors the reference values in <code>jf-k8s/</code>). Mode: <strong>${r.dbMode === "external" ? "external (external PostgreSQL + object-store binarystore)" : "self-contained (bundled PostgreSQL + filesystem PVC)"}</strong>, set by the Database input.</p>
+      <blockquote style="white-space:pre; font-family:monospace; font-style:normal;">${escapeHtml(cmds)}</blockquote>
+      <p style="margin:12px 0 4px; font-size:13px; color:var(--muted);">Generated <code>values.yaml</code> (sizing-derived — validate against your chart version):</p>
+      <blockquote style="white-space:pre; font-family:monospace; font-style:normal; max-height:340px; overflow:auto;">${escapeHtml(values)}</blockquote>
+      <button class="export" id="artifactBtn">⤓ Download values.yaml</button>
+      <div class="hint" style="margin-top:8px;">Secrets are placeholders — supply <code>masterKey</code>/<code>joinKey</code>/DB &amp; Valkey passwords via Kubernetes Secrets. Per-service <code>podSecurityContext</code> blocks are omitted for brevity — copy them from <code>jf-k8s/helm-values-k8s.yaml</code> for PodSecurity-restricted clusters. External RabbitMQ / Valkey wiring is layered on (the reference files keep both bundled). Reference: <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/install-jfrog-platform-using-helm-charts" target="_blank">Install JFrog Platform with Helm</a>.</div>
+    </details>`;
+  }
+  const inv = buildAnsibleInventory(r);
+  const play = buildAnsiblePlaybook(r);
+  const sys = buildSystemYamlTemplate(r);
+  return `
+    <details class="panel">
+      <summary style="font-size:14px;">Deployment artifacts — Virtual Machines (Ansible)</summary>
+      <p style="margin:10px 0 4px; font-size:13px; color:var(--muted);">JFrog has no single official Ansible collection; this follows the manual install (Linux archive + <code>system.yaml</code>). Adapt versions and secrets, then run <code>ansible-playbook -i inventory.ini site.yml</code>.</p>
+      <p style="margin:12px 0 4px; font-size:13px; color:var(--muted);"><strong>inventory.ini</strong> (hosts grouped by role, counts from the sizing):</p>
+      <blockquote style="white-space:pre; font-family:monospace; font-style:normal; max-height:200px; overflow:auto;">${escapeHtml(inv)}</blockquote>
+      <p style="margin:12px 0 4px; font-size:13px; color:var(--muted);"><strong>site.yml</strong>:</p>
+      <blockquote style="white-space:pre; font-family:monospace; font-style:normal; max-height:300px; overflow:auto;">${escapeHtml(play)}</blockquote>
+      <p style="margin:12px 0 4px; font-size:13px; color:var(--muted);"><strong>templates/system.yaml.j2</strong>:</p>
+      <blockquote style="white-space:pre; font-family:monospace; font-style:normal; max-height:240px; overflow:auto;">${escapeHtml(sys)}</blockquote>
+      <button class="export" id="artifactBtn">⤓ Download Ansible bundle</button>
+      <div class="hint" style="margin-top:8px;">Reference: <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/installing-artifactory" target="_blank">Installing Artifactory</a> &middot; <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/system-yaml-configuration-file" target="_blank">system.yaml</a>.</div>
+    </details>`;
+}
+
+function downloadArtifact(r) {
+  if (!r) return;
+  if (r.deployment === "k8s") {
+    downloadText("jfrog-platform-values.yaml", buildHelmValues(r), "application/x-yaml");
+  } else {
+    const bundle =
+      "# ===== inventory.ini =====\n" + buildAnsibleInventory(r) +
+      "\n\n# ===== site.yml =====\n" + buildAnsiblePlaybook(r) +
+      "\n\n# ===== templates/system.yaml.j2 =====\n" + buildSystemYamlTemplate(r);
+    downloadText("jpd-ansible-bundle.txt", bundle, "text/plain");
+  }
+}
+
+/* =============================================================================
+   Calculator application — calculate() + render() + UI wiring.
+   Single source for the calculator page (index.html). Handles both single and
+   Active+Passive topologies, VM and Kubernetes. Runs the initial calculate() at
+   load (this script is included at end of <body>, so the DOM is ready).
+   ============================================================================= */
+
+/* ---------- Calculator ---------- */
+
+function toggleConditionalFields() {
+  const deployment = document.querySelector('input[name="deployment"]:checked').value;
+  const topology   = document.querySelector('input[name="topology"]:checked').value;
+  document.getElementById("k8sPlacementField").style.display = deployment === "k8s" ? "" : "none";
+  document.getElementById("passiveScaleField").style.display = topology === "active-passive" ? "" : "none";
+  const usingLB = document.querySelector('input[name="ingress"]:checked').value === "lb";
+  document.getElementById("lbTargetField").style.display = usingLB ? "" : "none";
+  document.getElementById("valkeyField").style.display = document.getElementById("svcCuration").checked ? "" : "none";
+}
+
+function calculate() {
+  toggleConditionalFields();
+  const cloud         = document.querySelector('input[name="cloud"]:checked').value;
+  const deployment    = document.querySelector('input[name="deployment"]:checked').value;
+  const ha            = document.querySelector('input[name="ha"]:checked').value === "yes";
+  const dbMode        = document.querySelector('input[name="db"]:checked').value;
+  const k8sPlacement  = document.querySelector('input[name="k8sPlacement"]:checked')?.value || "dedicated";
+  const topology      = document.querySelector('input[name="topology"]:checked').value;
+  const passiveScale  = document.querySelector('input[name="passiveScale"]:checked')?.value || "hot";
+
+  const growthPct     = Math.max(0, parseFloat(document.getElementById("growthPct").value) || 0);
+  const growthFactor  = 1 + growthPct / 100;
+
+  // Raw inputs describe today's load. Sizing plans for the future, so the demand
+  // drivers are scaled by the growth factor and the deployment is sized for the
+  // projected state. Base values are kept for "today → projected" display.
+  const activeClientsInput = parseInt(document.getElementById("activeClients").value, 10) || 0;
+  const rpmInput           = parseInt(document.getElementById("rpm").value, 10) || 0;
+  const binaryTBInput      = parseFloat(document.getElementById("binaryStorageTB").value) || 0;
+  const xrayArtifactsInput = parseInt(document.getElementById("xrayArtifacts").value, 10) || 0;
+
+  const activeClients = Math.round(activeClientsInput * growthFactor);
+  const rpm           = Math.round(rpmInput * growthFactor);
+  const binaryTB      = Math.round(binaryTBInput * growthFactor * 10) / 10;
+  const xrayArtifacts = Math.round(xrayArtifactsInput * growthFactor);
+
+  const svc = {
+    distribution:   document.getElementById("svcDistribution").checked,
+    jas:            document.getElementById("svcJAS").checked,
+    workers:        document.getElementById("svcWorkers").checked,
+    appTrust:       document.getElementById("svcAppTrust").checked,
+    missionControl: document.getElementById("svcMissionControl").checked,
+    curation:       document.getElementById("svcCuration").checked
+  };
+
+  // Valkey (Curation/Catalog cache). Co-located folds onto the Catalog nodes;
+  // external removes it from the footprint and a recommended spec/config is shown.
+  const valkeyMode    = document.querySelector('input[name="valkey"]:checked').value; // colocated | external
+  const externalValkey = valkeyMode === "external";
+
+  // Local cache-fs: an SSD cache per Artifactory replica that fronts the object
+  // store. Sized as a percentage of the (projected) binary footprint.
+  const cacheFs    = document.querySelector('input[name="cachefs"]:checked').value === "yes";
+  const cacheFsPct = Math.max(0, parseFloat(document.getElementById("cacheFsPct").value) || 0);
+  const cacheFsGB  = cacheFs ? Math.round(binaryTB * 1024 * cacheFsPct / 100) : 0;
+
+  // Ingress: NGINX (bundled reverse proxy) or a Load Balancer. When an LB is used,
+  // it either routes straight to Artifactory (no NGINX tier) or to NGINX behind it.
+  const ingress    = document.querySelector('input[name="ingress"]:checked').value; // nginx | lb
+  const lbTarget   = document.querySelector('input[name="lbTarget"]:checked').value; // artifactory | nginx
+  const externalLB = ingress === "lb";
+  const provisionNginx = !externalLB || lbTarget === "nginx";
+
+  // RabbitMQ (Xray messaging). External removes the RMQ nodes from this footprint;
+  // the recommended external spec + plugin/config requirements are surfaced separately.
+  const externalRMQ  = document.querySelector('input[name="rmq"]:checked').value === "external";
+
+  // Effective tier = max of client-implied and RPM-implied tier.
+  const clientTier = tierFromClients(activeClients);
+  const rpmTierKey = tierFromRpm(rpm);
+  const tier       = maxTier(clientTier, rpmTierKey);
+  const tierMeta   = TIER_RPM[tier];
+  const arch       = REF_ARCH[cloud];
+  const cloudLabel = { aws:"AWS", azure:"Azure", gcp:"GCP", onprem:"Private Datacenter" }[cloud];
+
+  const lbDisplay = !externalLB
+    ? "JFrog NGINX (bundled reverse proxy)"
+    : { aws:"AWS ALB/NLB", azure:"Azure LB / Application Gateway", gcp:"Google Cloud Load Balancing", onprem:"External / hardware LB" }[cloud];
+
+  const xrayEnabled = xrayArtifacts > 0;
+
+  // Per-tier DB connection caps (for the external-database max_connections guidance).
+  const artiDbMaxConns = arch.artifactoryDb[tier].maxConns;
+  const xrayDbMaxConns = arch.xrayDb[tier].maxConns;
+
+  // Helper: build a row from REF_ARCH + REPLICAS + STORAGE for a given component.
+  function buildRow(key, displayName, opts = {}) {
+    const archEntry = arch[key][tier];
+    let replicas    = ha ? REPLICAS[key][tier] : 1;
+    if (opts.forceReplicas != null) replicas = opts.forceReplicas;
+    const storage   = opts.storage || STORAGE[key][tier];
+    return {
+      name: displayName,
+      replicas,
+      instance: archEntry.instance,
+      cpu: archEntry.cpu,
+      memGB: archEntry.memGB,
+      diskGB: storage.gb,
+      iops: storage.iops,
+      mbps: storage.mbps,
+      note: opts.note || ""
+    };
+  }
+
+  const components = [];
+
+  /* --- Artifactory --- */
+  // Distribution co-locates on Artifactory nodes: add 200 GB to its disk, note it, no new VMs.
+  let artiDisk = STORAGE.artifactory[tier].gb;
+  let artiNote = "Each replica on its own VM (JFrog dedicated-instance rule).";
+  if (svc.distribution) {
+    artiDisk += 200;
+    artiNote += " Distribution co-located (+200 GB).";
+  }
+  if (cacheFsGB > 0) {
+    artiDisk += cacheFsGB;
+    artiNote += ` Cache-fs +${cacheFsGB} GB local SSD (${cacheFsPct}% of binaries) fronting the object store.`;
+  }
+  components.push(buildRow("artifactory", "Artifactory", {
+    storage: { gb: artiDisk, iops: STORAGE.artifactory[tier].iops, mbps: STORAGE.artifactory[tier].mbps },
+    note: artiNote
+  }));
+
+  /* --- Nginx (only when bundled, or explicitly kept behind an external LB) --- */
+  if (provisionNginx) {
+    components.push(buildRow("nginx", "Nginx (reverse proxy / TLS)", {
+      storage: { gb: 50, iops: 3000, mbps: 200 },
+      note: externalLB
+        ? `Dedicated VM per replica, sitting behind the ${lbDisplay}.`
+        : "Dedicated VM per replica (JFrog rule). Acts as the reverse proxy / TLS terminator."
+    }));
+  }
+
+  /* --- Artifactory PostgreSQL --- */
+  {
+    const db = arch.artifactoryDb[tier];
+    const stor = STORAGE.artifactoryDb[tier];
+    const dbDiskGB = Math.max(100, Math.round(binaryTB * 1024 * stor.frac));
+    components.push({
+      name: "PostgreSQL (Artifactory DB)",
+      replicas: dbMode === "colocated" && ha ? 2 : 1,
+      instance: dbMode === "external" ? db.instance : `Co-located ${db.cpu} vCPU / ${db.memGB} GB`,
+      cpu: db.cpu,
+      memGB: db.memGB,
+      diskGB: dbDiskGB,
+      iops: stor.iops,
+      mbps: stor.mbps,
+      note: dbMode === "external"
+        ? `External managed RDBMS (max ${db.maxConns} conns). Disk = 1/3 of binary filestore.`
+        : `Co-located (max ${db.maxConns} conns). Disk = 1/3 of binary filestore. Primary+standby for HA.`
+    });
+  }
+
+  /* --- Xray + RabbitMQ + Xray DB --- */
+  let externalRmqSpec = null;
+  if (xrayEnabled) {
+    components.push(buildRow("xray", "Xray", {
+      note: "Dedicated VM per replica. Index time scales with artifact count."
+    }));
+    // RabbitMQ must be deployed in odd-numbered clusters (quorum queues need majority consensus).
+    // Single node (1) is acceptable for non-HA small deployments; any cluster ≥ 2 must be rounded up to the next odd number.
+    const oddify = n => (n <= 1 ? n : (n % 2 === 0 ? n + 1 : n));
+    const rmqBase     = ha ? REPLICAS.rabbitmq[tier] : (xrayArtifacts > 100000 ? 3 : 1);
+    const rmqReplicas = oddify(rmqBase);
+    const rmqArch     = arch.rabbitmq[tier];
+    const rmqStor     = STORAGE.rabbitmq[tier];
+    const quorumNote  = rmqReplicas >= 3
+      ? `Odd node count (${rmqReplicas}) enforced for quorum — tolerates ${(rmqReplicas - 1) / 2} node failure${(rmqReplicas - 1) / 2 === 1 ? "" : "s"}.`
+      : "Single-node mode — no quorum / no failure tolerance.";
+    if (externalRMQ) {
+      externalRmqSpec = {
+        replicas: rmqReplicas, instance: rmqArch.instance, cpu: rmqArch.cpu, memGB: rmqArch.memGB,
+        diskGB: rmqStor.gb, iops: rmqStor.iops, mbps: rmqStor.mbps, quorumNote
+      };
+    } else {
+      const splitNote   = xrayArtifacts > 100000 || ha
+        ? "Split mode — RabbitMQ on separate VMs from Xray (JFrog HA rule)."
+        : "Co-located permitted at ≤100K artifacts (still split here for safety).";
+      components.push(buildRow("rabbitmq", "RabbitMQ (Xray)", {
+        forceReplicas: rmqReplicas,
+        note: `${splitNote} ${quorumNote}`
+      }));
+    }
+    const xdb = arch.xrayDb[tier];
+    const xdbStor = STORAGE.xrayDb[tier];
+    components.push({
+      name: "PostgreSQL (Xray DB)",
+      replicas: dbMode === "colocated" && ha ? 2 : 1,
+      instance: dbMode === "external" ? xdb.instance : `Co-located ${xdb.cpu} vCPU / ${xdb.memGB} GB`,
+      cpu: xdb.cpu,
+      memGB: xdb.memGB,
+      diskGB: xdbStor.gb,
+      iops: xdbStor.iops,
+      mbps: xdbStor.mbps,
+      note: dbMode === "external"
+        ? `External managed RDBMS (max ${xdb.maxConns} conns).`
+        : `Co-located (max ${xdb.maxConns} conns). Primary+standby for HA.`
+    });
+  }
+
+  /* --- JAS (Advanced Security) --- */
+  if (svc.jas && xrayEnabled) {
+    components.push(buildRow("jas", "JAS (Xray Advanced Security)", {
+      note: "Dedicated node pool required (JFrog rule — protects Xray + Artifactory)."
+    }));
+  } else if (svc.jas && !xrayEnabled) {
+    // JAS is part of Xray — silently ignore if Xray disabled (warning shown elsewhere).
+  }
+
+  /* --- Optional services from hardware sizing matrix --- */
+  if (svc.workers) {
+    components.push({
+      name: "Workers",
+      replicas: ha ? 2 : 1,
+      instance: arch.nginx[tier].instance, // small footprint - use nginx-class VM as a proxy
+      cpu: 4, memGB: 4, diskGB: 50, iops: 3000, mbps: 200,
+      note: "Hardware sizing matrix: 4 CPU / 4 GB / 50 GB. Requires Artifactory ≥ 7.98.4."
+    });
+  }
+  if (svc.appTrust) {
+    components.push({
+      name: "AppTrust",
+      replicas: ha ? 2 : 1,
+      instance: arch.nginx[tier].instance,
+      cpu: 2, memGB: 1, diskGB: 50, iops: 3000, mbps: 200,
+      note: "Hardware sizing matrix: 2 CPU / 1 GB / 50 GB."
+    });
+    components.push({
+      name: "UnifiedPolicy",
+      replicas: ha ? 2 : 1,
+      instance: arch.nginx[tier].instance,
+      cpu: 2, memGB: 1, diskGB: 50, iops: 3000, mbps: 200,
+      note: "Required alongside AppTrust. 2 CPU / 1 GB / 50 GB."
+    });
+  }
+  if (svc.missionControl) {
+    components.push({
+      name: "Mission Control",
+      replicas: 1,
+      instance: arch.nginx[tier].instance,
+      cpu: 4, memGB: 8, diskGB: 100, iops: 3000, mbps: 200,
+      note: "Single management plane (not HA)."
+    });
+  }
+
+  /* --- Curation + Catalog (+ Catalog DB, + Valkey co-located or external) --- */
+  let externalValkeySpec = null;
+  if (svc.curation) {
+    const proxyVM = arch.nginx[tier].instance;
+    components.push({
+      name: "Curation",
+      replicas: ha ? 2 : 1,
+      instance: proxyVM,
+      cpu: 4, memGB: 8, diskGB: 50, iops: 3000, mbps: 200,
+      note: "Request-path package curation (policy enforcement). Works alongside Xray."
+    });
+    let catalogMem  = 16;
+    let catalogNote = "Serves the package-metadata catalog for Curation.";
+    if (!externalValkey) { catalogMem += 8; catalogNote += " Valkey co-located (+8 GB RAM, no new VMs)."; }
+    components.push({
+      name: "Catalog",
+      replicas: ha ? 2 : 1,
+      instance: proxyVM,
+      cpu: 8, memGB: catalogMem, diskGB: 100, iops: 3000, mbps: 500,
+      note: catalogNote
+    });
+    if (externalValkey) {
+      externalValkeySpec = { replicas: ha ? 3 : 1, instance: proxyVM, cpu: 2, memGB: 8, diskGB: 20, iops: 3000, mbps: 200 };
+    }
+    const cdb = arch.xrayDb.small;
+    components.push({
+      name: "PostgreSQL (Catalog DB)",
+      replicas: dbMode === "colocated" && ha ? 2 : 1,
+      instance: dbMode === "external" ? cdb.instance : `Co-located ${cdb.cpu} vCPU / ${cdb.memGB} GB`,
+      cpu: cdb.cpu, memGB: cdb.memGB, diskGB: 200, iops: 4000, mbps: 500,
+      note: dbMode === "external"
+        ? `External managed RDBMS (max ${cdb.maxConns} conns) — Catalog metadata store.`
+        : "Co-located — Catalog metadata store. Primary+standby for HA."
+    });
+  }
+
+  /* --- Compute totals for the active cluster --- */
+  function totalsOf(comps) {
+    let cpu = 0, mem = 0, disk = 0, nodes = 0;
+    comps.forEach(c => {
+      c.totalCPU  = c.cpu * c.replicas;
+      c.totalMem  = c.memGB * c.replicas;
+      c.totalDisk = c.diskGB * c.replicas;
+      cpu += c.totalCPU; mem += c.totalMem; disk += c.totalDisk; nodes += c.replicas;
+    });
+    return { cpu, mem, disk, nodes };
+  }
+  const activeTotals = totalsOf(components);
+
+  /* --- Build the passive cluster if active/passive topology is selected --- */
+  let passiveComponents = null;
+  let passiveTotals     = null;
+  if (topology === "active-passive") {
+    // Deep-copy components and rescale replicas based on the passive scale mode.
+    // Hot = identical; Warm = 1 replica per component (RabbitMQ rounded up to 3 for quorum), same DB sizing.
+    passiveComponents = components.map(c => {
+      const copy = { ...c };
+      if (passiveScale === "warm") {
+        if (c.name === "RabbitMQ (Xray)") {
+          copy.replicas = c.replicas >= 3 ? 3 : 1; // keep quorum-capable
+        } else if (c.name.startsWith("PostgreSQL")) {
+          copy.replicas = c.replicas; // keep DB at full sizing for fast failover (still 1 in managed, 2 if self-HA)
+        } else {
+          copy.replicas = 1;
+        }
+        copy.note = `Warm standby — ${copy.note}`;
+      } else {
+        copy.note = `Hot standby (mirror) — ${copy.note}`;
+      }
+      return copy;
+    });
+    passiveTotals = totalsOf(passiveComponents);
+  }
+
+  const binaryStorageTarget = STORAGE_CLASS[cloud].object;
+
+  render({
+    cloud, cloudLabel, deployment, ha, dbMode, k8sPlacement, topology, passiveScale,
+    tier, tierMeta, clientTier, rpmTierKey,
+    activeClients, rpm, binaryTB,
+    growthPct, activeClientsInput, rpmInput, binaryTBInput, xrayArtifactsInput,
+    cacheFs, cacheFsPct, cacheFsGB,
+    lbDisplay, externalLB, provisionNginx,
+    externalRMQ, externalRmqSpec,
+    valkeyMode, externalValkey, externalValkeySpec,
+    artiDbMaxConns, xrayDbMaxConns,
+    xrayArtifacts, xrayEnabled, svc,
+    components, activeTotals,
+    passiveComponents, passiveTotals,
+    binaryStorageTarget
+  });
+}
+
+/* ---------- Render ---------- */
+
+let lastResult = null; // most recent render() input, for CSV export
+
+function render(r) {
+  lastResult = r;
+  const deployLabel = r.deployment === "k8s" ? "Kubernetes" : "Virtual Machines";
+  const tierName    = TIER_LABEL[r.tier];
+  const isAP        = r.topology === "active-passive";
+  const placement   = r.deployment === "k8s"
+    ? (r.k8sPlacement === "antiaffinity" ? "K8s anti-affinity (shared pool)" : "K8s dedicated node pool")
+    : "VM (one Artifactory per VM)";
+  let html = "";
+
+  /* Summary */
+  html += `
+    <div class="panel">
+      <h2>Deployment summary</h2>
+      <div class="summary-grid">
+        <div class="stat"><div class="label">Environment</div><div class="value">${r.cloudLabel}</div></div>
+        <div class="stat"><div class="label">Model</div><div class="value">${deployLabel}</div></div>
+        <div class="stat"><div class="label">Tier</div><div class="value">${tierName}</div></div>
+        <div class="stat"><div class="label">Topology</div><div class="value">${isAP ? "Active+Passive" : "Single"}</div></div>
+      </div>
+      <div style="margin-top:14px;">
+        <span class="chip">${r.activeClients} active clients → ${TIER_LABEL[r.clientTier]}</span>
+        <span class="chip">${r.rpm.toLocaleString()} RPM → ${TIER_LABEL[r.rpmTierKey]} (≤ ${r.tierMeta.maxConns} conns)</span>
+        <span class="chip warn">Effective tier: ${tierName} (max of both)</span>
+        ${r.xrayEnabled ? `<span class="chip">Xray ${r.xrayArtifacts.toLocaleString()} indexed</span>` : `<span class="chip">No Xray</span>`}
+        ${r.growthPct > 0 ? `<span class="chip warn">+${r.growthPct}% growth headroom</span>` : ""}
+        ${r.cacheFsGB > 0 ? `<span class="chip ok">Cache-fs ${fmtGB(r.cacheFsGB)}/node</span>` : ""}
+      </div>
+      <div style="margin-top:10px;">
+        <span class="chip ok">${r.ha ? "HA enabled" : "Single replica"}</span>
+        <span class="chip ok">Placement: ${placement}</span>
+        <span class="chip ok">LB: ${r.lbDisplay}</span>
+        ${r.externalLB && !r.provisionNginx ? `<span class="chip warn">No Nginx tier</span>` : ""}
+        ${r.externalRMQ && r.xrayEnabled ? `<span class="chip warn">External RabbitMQ</span>` : ""}
+        ${r.svc.curation ? `<span class="chip ok">Curation + Catalog</span>` : ""}
+        ${r.svc.curation && r.externalValkey ? `<span class="chip warn">External Valkey</span>` : ""}
+        ${isAP ? `<span class="chip warn">Passive: ${r.passiveScale === "hot" ? "Hot mirror" : "Warm minimal"}</span>` : ""}
+      </div>
+      ${r.growthPct > 0 ? `
+      <div class="notice info" style="margin-top:12px;">
+        <strong>Sized for ${r.growthPct}% projected growth.</strong>
+        Today → projected:
+        ${r.activeClientsInput.toLocaleString()} → <strong>${r.activeClients.toLocaleString()}</strong> clients ·
+        ${r.rpmInput.toLocaleString()} → <strong>${r.rpm.toLocaleString()}</strong> RPM ·
+        ${r.binaryTBInput} → <strong>${r.binaryTB} TB</strong> binaries${r.xrayEnabled ? ` ·
+        ${r.xrayArtifactsInput.toLocaleString()} → <strong>${r.xrayArtifacts.toLocaleString()}</strong> indexed artifacts` : ""}.
+      </div>` : ""}
+    </div>
+  `;
+
+  /* Warnings */
+  const warnings = [];
+  if (r.activeClients > 200)             warnings.push({type:"danger", text:"Active clients exceed 200 — contact JFrog Support for custom Enterprise+ sizing."});
+  if (r.rpm > 500000)                    warnings.push({type:"danger", text:"RPM exceeds published 2XLarge tier (500K). Custom sizing required."});
+  if (r.xrayArtifacts > 10000000)        warnings.push({type:"danger", text:"Indexed artifacts exceed 10M — contact JFrog Support."});
+  if (r.svc.jas && !r.xrayEnabled)       warnings.push({type:"warn",   text:"JAS requires Xray. Enable Xray or uncheck JAS — it has been skipped."});
+  if (r.deployment === "k8s")            warnings.push({type:"info",   text:"<strong>Kubernetes:</strong> the per-replica vCPU/RAM below represent the worker-node capacity each pod needs. JFrog's Helm chart sizing presets (in <code>jfrog/charts</code>) define authoritative per-pod requests/limits — typically smaller because requests are floors, not host totals."});
+
+  if (warnings.length) {
+    html += `<div class="panel"><h2>Notes &amp; warnings</h2>`;
+    warnings.forEach(w => {
+      const cls = w.type === "danger" ? "danger" : w.type === "info" ? "info" : "";
+      html += `<div class="notice ${cls}" style="margin-bottom:8px;">${w.text}</div>`;
+    });
+    html += `</div>`;
+  }
+
+  /* Aggregate footprint */
+  const nodeStatLabel = r.deployment === "k8s" ? "Total nodes" : "VM instances";
+  function footprintCard(label, t) {
+    return `
+      <div class="panel">
+        <h2>${label}</h2>
+        <div class="summary-grid">
+          <div class="stat"><div class="label">${nodeStatLabel}</div><div class="value">${t.nodes}</div></div>
+          <div class="stat"><div class="label">vCPU</div><div class="value">${t.cpu}</div></div>
+          <div class="stat"><div class="label">Memory</div><div class="value">${t.mem}<span class="unit">GB</span></div></div>
+          <div class="stat"><div class="label">Service disk</div><div class="value">${fmtGB(t.disk)}</div></div>
+        </div>
+      </div>
+    `;
+  }
+  if (isAP) {
+    const gt = {
+      nodes: r.activeTotals.nodes + r.passiveTotals.nodes,
+      cpu:   r.activeTotals.cpu   + r.passiveTotals.cpu,
+      mem:   r.activeTotals.mem   + r.passiveTotals.mem,
+      disk:  r.activeTotals.disk  + r.passiveTotals.disk
+    };
+    html += footprintCard("Grand total (Active + Passive)", gt);
+    html += `<div class="totals">
+      ${footprintCard("Active site", r.activeTotals)}
+      ${footprintCard("Passive site (" + (r.passiveScale === "hot" ? "Hot mirror" : "Warm minimal") + ")", r.passiveTotals)}
+    </div>`;
+  } else {
+    html += footprintCard("Aggregate footprint", r.activeTotals);
+  }
+
+  /* Kubernetes cluster plan — group component node recommendations into node pools.
+     Cluster capacity adds ~15% headroom for kubelet/OS/CNI and system DaemonSets. */
+  if (r.deployment === "k8s") {
+    const SYS_OVERHEAD = 1.15;
+    // Managed databases run outside the cluster — exclude them from the worker plan.
+    const externalDb = r.dbMode === "external";
+    const k8sPlan = comps => {
+      const workerComps = comps.filter(c => !(externalDb && c.name.startsWith("PostgreSQL")));
+      const externalDbs = externalDb ? comps.filter(c => c.name.startsWith("PostgreSQL")) : [];
+      const pools = {};
+      workerComps.forEach(c => {
+        if (!pools[c.instance]) pools[c.instance] = { instance: c.instance, cpu: c.cpu, memGB: c.memGB, count: 0, usedBy: [] };
+        pools[c.instance].count += c.replicas;
+        pools[c.instance].usedBy.push(`${c.name}${c.replicas > 1 ? ` ×${c.replicas}` : ""}`);
+      });
+      const arr = Object.values(pools).sort((a, b) => b.count - a.count);
+      const workerNodes = arr.reduce((s, p) => s + p.count, 0);
+      const workerCPU   = arr.reduce((s, p) => s + p.cpu * p.count, 0);
+      const workerMem   = arr.reduce((s, p) => s + p.memGB * p.count, 0);
+      const dbNote = externalDbs.length
+        ? ` Plus ${externalDbs.length} managed database${externalDbs.length > 1 ? "s" : ""} (${externalDbs.map(d => d.instance).join(", ")}) provisioned as external managed service${externalDbs.length > 1 ? "s" : ""}, outside the cluster.`
+        : "";
+      return { pools: arr, workerNodes, workerCPU, workerMem,
+        clusterCPU: Math.ceil(workerCPU * SYS_OVERHEAD), clusterMem: Math.ceil(workerMem * SYS_OVERHEAD), dbNote };
+    };
+    const cpName = { aws: "EKS", azure: "AKS", gcp: "GKE" }[r.cloud];
+    const controlPlaneNote = r.cloud === "onprem"
+      ? "Self-managed control plane: add 3 dedicated control-plane nodes (4 vCPU / 8 GB each, stacked etcd) per cluster for quorum — not counted in the worker totals."
+      : `Managed control plane (${cpName}) — control-plane sizing &amp; HA are handled by the cloud provider, at no worker-node cost.`;
+    const placementNote = r.k8sPlacement === "antiaffinity"
+      ? "Anti-affinity (shared pool): stateful pods are spread across nodes but may share them — node count is an upper bound that bin-packing can reduce."
+      : "Dedicated node pool: one Artifactory/Nginx/Xray pod per node. Smaller stateless pods can share nodes — figures are a safe upper bound.";
+    const k8sPlanCard = (label, plan) => `
+      <div class="panel">
+        <h2>Kubernetes cluster plan — ${label}</h2>
+        <div class="summary-grid">
+          <div class="stat"><div class="label">Worker nodes</div><div class="value">${plan.workerNodes}</div></div>
+          <div class="stat"><div class="label">Node pools</div><div class="value">${plan.pools.length}</div></div>
+          <div class="stat"><div class="label">Cluster vCPU</div><div class="value">${plan.clusterCPU}<span class="unit">w/ sys</span></div></div>
+          <div class="stat"><div class="label">Cluster RAM</div><div class="value">${plan.clusterMem}<span class="unit">GB w/ sys</span></div></div>
+        </div>
+        <table style="margin-top:12px;">
+          <thead><tr><th>Node pool (VM size)</th><th>vCPU</th><th>RAM</th><th>Nodes</th><th>Runs</th></tr></thead>
+          <tbody>
+            ${plan.pools.map(p => `
+              <tr>
+                <td><code>${p.instance}</code></td>
+                <td>${p.cpu}</td>
+                <td>${p.memGB} GB</td>
+                <td><strong>${p.count}</strong></td>
+                <td><span class="hint">${p.usedBy.join(", ")}</span></td>
+              </tr>`).join("")}
+            <tr style="background:var(--panel-2);">
+              <td><strong>Total worker capacity</strong></td>
+              <td><strong>${plan.workerCPU}</strong></td>
+              <td><strong>${plan.workerMem} GB</strong></td>
+              <td><strong>${plan.workerNodes}</strong></td>
+              <td></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="notice info" style="margin-top:12px;">
+          <strong>Cluster sizing:</strong> ${plan.workerNodes} worker nodes across ${plan.pools.length} node pool${plan.pools.length === 1 ? "" : "s"} provide <strong>${plan.workerCPU} vCPU / ${plan.workerMem} GB</strong> of pod-schedulable capacity. Adding ~15% for kubelet, OS, CNI and system DaemonSets, provision ≈ <strong>${plan.clusterCPU} vCPU / ${plan.clusterMem} GB</strong>. ${controlPlaneNote}${plan.dbNote}
+        </div>
+        <div class="hint" style="margin-top:8px;">${placementNote}</div>
+      </div>
+    `;
+    if (isAP) {
+      html += k8sPlanCard("Active site", k8sPlan(r.components));
+      html += k8sPlanCard("Passive site (" + (r.passiveScale === "hot" ? "Hot mirror" : "Warm minimal") + ")", k8sPlan(r.passiveComponents));
+    } else {
+      html += k8sPlanCard(r.cloudLabel, k8sPlan(r.components));
+    }
+  }
+
+  // Storage + network row (shared across topology)
+  html += `
+    <div class="panel">
+      <div class="totals">
+        <div class="total-card">
+          <div class="label">Binary / artifact storage</div>
+          <div class="value">${isAP ? (r.binaryTB * 2) : r.binaryTB} TB</div>
+          <div class="hint" style="margin-top:6px;">${r.binaryStorageTarget}${isAP ? ` — ${r.binaryTB} TB per site (federation replicates active → passive)` : ""}</div>
+        </div>
+        <div class="total-card">
+          <div class="label">Network</div>
+          <div class="value">${NETWORK_REC[r.cloud].split(",")[0]}</div>
+          <div class="hint" style="margin-top:6px;">${NETWORK_REC[r.cloud]}${isAP ? " Cross-site replication: ensure adequate WAN bandwidth + low latency for federation." : ""}</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  /* Per-component table + procurement tally — rendered per cluster */
+  const instColHeader = r.deployment === "k8s" ? "Recommended node-pool VM" : "VM instance";
+  function clusterSection(label, comps) {
+    let h = `
+      <div class="panel">
+        <h2>${label} — per-component sizing (${r.cloudLabel} ${tierName}, ${deployLabel})</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Component</th><th>Replicas</th><th>vCPU</th><th>RAM</th>
+              <th>Disk / IOPS</th><th>${instColHeader}</th><th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+    `;
+    comps.forEach(c => {
+      h += `
+        <tr>
+          <td><strong>${c.name}</strong></td>
+          <td>${c.replicas}</td>
+          <td>${c.cpu}</td>
+          <td>${c.memGB} GB</td>
+          <td>${fmtGB(c.diskGB)} <span class="hint">/ ${c.iops.toLocaleString()} IOPS</span></td>
+          <td><code>${c.instance}</code><br><span class="hint">${c.cpu} vCPU / ${c.memGB} GB</span></td>
+          <td><span class="hint">${c.note}</span></td>
+        </tr>
+      `;
+    });
+    h += `</tbody></table></div>`;
+
+    // Procurement tally for this cluster
+    const tally = {};
+    comps.forEach(c => {
+      const key = c.instance;
+      if (!tally[key]) tally[key] = { cpu: c.cpu, memGB: c.memGB, count: 0, usedBy: [] };
+      tally[key].count += c.replicas;
+      tally[key].usedBy.push(`${c.name} ×${c.replicas}`);
+    });
+    const rows = Object.entries(tally).sort((a,b) => b[1].count - a[1].count);
+    const total = rows.reduce((s,[,v]) => s + v.count, 0);
+    const procTitle = r.deployment === "k8s"
+      ? `${label} — ${r.cloudLabel} VMs for worker pool`
+      : `${label} — ${r.cloudLabel} VM procurement list`;
+    h += `<div class="panel"><h2>${procTitle}</h2>
+      <table>
+        <thead><tr><th>VM type</th><th>vCPU</th><th>RAM</th><th>Count</th><th>Used by</th></tr></thead>
+        <tbody>`;
+    rows.forEach(([name, info]) => {
+      h += `<tr>
+        <td><code>${name}</code></td>
+        <td>${info.cpu}</td>
+        <td>${info.memGB} GB</td>
+        <td><strong>${info.count}</strong></td>
+        <td><span class="hint">${info.usedBy.join(", ")}</span></td>
+      </tr>`;
+    });
+    h += `<tr style="background:var(--panel-2);">
+        <td colspan="3"><strong>Total VM instances</strong></td>
+        <td><strong>${total}</strong></td>
+        <td></td>
+      </tr></tbody></table></div>`;
+    return h;
+  }
+
+  html += clusterSection(isAP ? "Active site" : "Cluster", r.components);
+  if (isAP) html += clusterSection("Passive site", r.passiveComponents);
+
+  /* Co-location rules */
+  html += `
+    <details class="panel" open>
+      <summary style="font-size:14px;">Co-location rules (from JFrog reference architecture)</summary>
+      <table>
+        <thead><tr><th>Rule</th><th>Relation</th><th>Applies to</th></tr></thead>
+        <tbody>
+  `;
+  COLOCATION_RULES.forEach(rule => {
+    const cls = rule.relation === "co-locate" ? "ok" : rule.relation === "odd-quorum" ? "danger" : "warn";
+    html += `
+      <tr>
+        <td><blockquote>"${rule.rule}"</blockquote></td>
+        <td><span class="chip ${cls}">${rule.relation}</span></td>
+        <td>${rule.components.map(c => `<span class="chip">${c}</span>`).join("")}</td>
+      </tr>
+    `;
+  });
+  html += `</tbody></table>`;
+  // Show explicitly which rule was applied in this calculation
+  const applied = [];
+  if (r.svc.distribution) applied.push("Distribution co-located onto Artifactory nodes (+200 GB disk, no new VMs).");
+  if (r.xrayEnabled && r.externalRMQ) {
+    applied.push(`RabbitMQ externalized — ${r.externalRmqSpec.replicas} node(s) provisioned and operated outside the platform (no RMQ nodes in this footprint). See the External RabbitMQ requirements below.`);
+  }
+  if (r.xrayEnabled && !r.externalRMQ && (r.xrayArtifacts > 100000 || r.ha)) applied.push("RabbitMQ deployed in split mode on dedicated VMs (Xray HA / >100K artifacts).");
+  if (r.xrayEnabled && !r.externalRMQ) {
+    const rmqRow = r.components.find(c => c.name === "RabbitMQ (Xray)");
+    if (rmqRow && rmqRow.replicas >= 3) {
+      applied.push(`RabbitMQ replica count rounded to odd (${rmqRow.replicas}) for quorum — tolerates ${(rmqRow.replicas - 1) / 2} simultaneous node failure(s).`);
+    } else if (rmqRow && rmqRow.replicas === 1) {
+      applied.push("RabbitMQ running single-node (no quorum) — acceptable only for non-HA Small deployments.");
+    }
+  }
+  if (r.svc.jas && r.xrayEnabled) applied.push("JAS deployed on its own dedicated VM (Xray protection rule).");
+  if (r.svc.curation) {
+    applied.push(`Curation + Catalog deployed on dedicated nodes, with a Catalog database (catalogdb). Valkey is ${r.externalValkey ? "external (provisioned separately — see below)" : "co-located on the Catalog nodes (+8 GB RAM, no new VMs)"}.`);
+  }
+  if (!r.externalLB) {
+    applied.push("JFrog bundled Nginx provides reverse proxy / TLS termination (dedicated VM/node per replica).");
+  } else if (r.provisionNginx) {
+    applied.push(`${r.lbDisplay} front-ends the platform; Nginx is kept behind it for advanced proxy features (dedicated VM/node per replica).`);
+  } else {
+    applied.push(`${r.lbDisplay} terminates TLS and routes directly to Artifactory's built-in router — dedicated Nginx tier omitted (no Nginx nodes).`);
+  }
+  if (r.deployment === "k8s" && r.k8sPlacement === "antiaffinity") {
+    applied.push("Kubernetes <strong>podAntiAffinity</strong> on shared node pool — Artifactory replicas spread across distinct nodes, but the pool may also host other JFrog services. Node count unchanged (still 1 node per Artifactory replica due to anti-affinity).");
+  } else if (r.deployment === "k8s") {
+    applied.push("Kubernetes <strong>dedicated node pool</strong> for Artifactory — one pod per node, no other workloads share the pool (JFrog recommendation).");
+  } else {
+    applied.push("Each Artifactory replica on its own dedicated VM (VM model).");
+  }
+  applied.push(`Artifactory${r.provisionNginx ? ", Nginx" : ""}, Xray: dedicated VM/node per replica (no co-mingling between these services).`);
+  if (r.topology === "active-passive") {
+    const scaleDesc = r.passiveScale === "hot" ? "identical replica counts for instant failover" : "1 replica per component (RabbitMQ kept at 3 for quorum), DB at full sizing for fast scale-up";
+    applied.push(`<strong>Active+Passive DR topology</strong> — passive site sized as <em>${r.passiveScale === "hot" ? "Hot mirror" : "Warm minimal"}</em>: ${scaleDesc}. Use Artifactory federation / replication for data sync between sites.`);
+  }
+  html += `<div style="margin-top:14px;"><div class="hint" style="margin-bottom:6px;">Applied in this configuration:</div>`;
+  applied.forEach(a => { html += `<div class="notice ok" style="margin-bottom:6px;">${a}</div>`; });
+  html += `</div></details>`;
+
+  /* Storage & network */
+  const sc = STORAGE_CLASS[r.cloud];
+  const bs = BINARY_STORE[r.cloud];
+  html += `
+    <div class="panel">
+      <h2>Storage &amp; network — ${r.cloudLabel}</h2>
+      <table>
+        <tbody>
+          <tr><td><strong>Service disks (block)</strong></td><td>${sc.block} — sized per-tier (Artifactory 500/1000 GB, Xray 100/200 GB, RabbitMQ 100 GB, JAS 300 GB)</td></tr>
+          <tr><td><strong>Database disks</strong></td><td>${sc.premium} — Artifactory DB ≈ 1/3 of filestore; Xray DB 500–2500 GB per tier; IOPS 4K–20K</td></tr>
+          <tr><td><strong>Binary / artifact backend</strong></td><td><strong>${bs.best.name}</strong> <span class="chip ok">JFrog recommended</span> — sized at <strong>${r.binaryTB} TB</strong>${isAP ? " per site" : ""}. <span class="hint">binarystore.xml: <code>${bs.best.template}</code>. ${bs.best.note}</span><div class="hint" style="margin-top:4px;">Other options: ${bs.alternatives.map(a => `${a.name} (<code>${a.template}</code>)`).join(" · ")}.</div></td></tr>
+          ${r.cacheFsGB > 0 ? `<tr><td><strong>Cache-fs (binary cache)</strong></td><td>${sc.block} — <strong>${fmtGB(r.cacheFsGB)}</strong> local SSD per Artifactory replica (${r.cacheFsPct}% of filestore); fronts ${sc.object} so hot artifacts are served at local-disk latency</td></tr>` : `<tr><td><strong>Cache-fs (binary cache)</strong></td><td>Disabled — every binary read hits ${sc.object} directly. Enable for better performance with object storage.</td></tr>`}
+          <tr><td><strong>Load balancer / ingress</strong></td><td><strong>${r.lbDisplay}</strong> — ${r.externalLB ? (r.provisionNginx ? "Nginx provisioned behind the LB for advanced proxy features." : "no dedicated Nginx tier; the LB terminates TLS and routes to Artifactory's built-in router.") : "bundled Nginx reverse proxy on a dedicated VM/node per replica."}${r.deployment === "k8s" ? " On K8s, expose it via the cluster ingress / cloud LB service." : ""}${isAP ? " Provide a global/cross-site LB or DNS failover to direct traffic to the active site." : ""} <span class="hint">Config: <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/configure-the-reverse-proxy" target="_blank">Reverse Proxy / LB</a>${r.externalLB ? ` &middot; <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/http-settings" target="_blank">HTTP Settings</a>` : ""}.</span></td></tr>
+          <tr><td><strong>Network</strong></td><td>${NETWORK_REC[r.cloud]}</td></tr>
+          ${r.deployment === "k8s" ? `<tr><td><strong>Kubernetes</strong></td><td>${K8S_NOTES[r.cloud]}</td></tr>` : ""}
+        </tbody>
+      </table>
+    </div>
+  `;
+
+  /* Database setup — required databases, users & configuration (always external here) */
+  {
+    const dbs = [{ svc:"Artifactory", db:"artifactory", user:"artifactory", note:"Core platform metadata — always required." }];
+    if (r.xrayEnabled) dbs.push({ svc:`Xray${r.svc.jas ? " + JAS" : ""}`, db:"xraydb", user:"xray", note:`Scan results & component graph.${r.svc.jas ? " JAS shares the Xray database — no separate DB." : ""}` });
+    if (r.svc.distribution) dbs.push({ svc:"Distribution", db:"distribution", user:"distribution", note:"Release-bundle metadata." });
+    if (r.svc.missionControl) dbs.push({ svc:"Mission Control", db:"mission_control", user:"mission_control", note:"Management-plane data." });
+    if (r.svc.curation) dbs.push({ svc:"Catalog (Curation)", db:"catalogdb", user:"catalog", note:"Package-metadata catalog for Curation." });
+
+    const newer = [];
+    if (r.svc.workers)  newer.push("Workers");
+    if (r.svc.appTrust) newer.push("AppTrust + Unified Policy");
+
+    const dbHost = { aws:"my-rds-endpoint.rds.amazonaws.com", azure:"my-flexible-server.postgres.database.azure.com", gcp:"my-cloudsql-ip", onprem:"db-host" }[r.cloud];
+    const totalConns = r.artiDbMaxConns + (r.xrayEnabled ? r.xrayDbMaxConns : 0);
+
+    html += `
+    <details class="panel" open>
+      <summary style="font-size:14px;">Database setup — required databases, users &amp; configuration</summary>
+      <div class="notice info" style="margin-top:10px;">
+        ${r.dbMode === "external"
+          ? `Create the databases below in your managed PostgreSQL (RDS / Cloud SQL / Flexible Server); JFrog connects over JDBC.`
+          : `Create the databases below in your co-located PostgreSQL (the Helm chart's bundled DB on K8s, or a primary${r.ha ? " + standby for HA" : ""}).`}
+        Each JFrog service needs its <strong>own database</strong> — they are not shared.
+      </div>
+      <table>
+        <thead><tr><th>Service</th><th>Database</th><th>DB user</th><th>Notes</th></tr></thead>
+        <tbody>
+          ${dbs.map(d => `<tr><td><strong>${d.svc}</strong></td><td><code>${d.db}</code></td><td><code>${d.user}</code></td><td><span class="hint">${d.note}</span></td></tr>`).join("")}
+          ${newer.length ? `<tr><td><strong>${newer.join(", ")}</strong></td><td colspan="3"><span class="hint">Recent services may require their own database/schema in current releases — confirm the exact name in each service's install docs before provisioning.</span></td></tr>` : ""}
+        </tbody>
+      </table>
+      <p style="margin:12px 0 4px;"><strong>Create each database</strong> (PostgreSQL — repeat per service, UTF8 encoding):</p>
+      <blockquote style="white-space:pre; font-family:monospace; font-style:normal;">CREATE USER &lt;user&gt; WITH PASSWORD '&lt;password&gt;';
+CREATE DATABASE &lt;db&gt; WITH OWNER=&lt;user&gt; ENCODING='UTF8';
+GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
+      <p style="margin:12px 0 4px;"><strong>Point each product at its database</strong> in that product's <code>system.yaml</code> (Artifactory shown):</p>
+      <blockquote style="white-space:pre; font-family:monospace; font-style:normal;">shared:
+  database:
+    type: postgresql
+    driver: org.postgresql.Driver
+    url: "jdbc:postgresql://${dbHost}:5432/artifactory"
+    username: artifactory
+    password: "&lt;password&gt;"</blockquote>
+      <ul style="margin:4px 0 10px; padding-left:20px; color:var(--muted); font-size:13px; line-height:1.7;">
+        <li><strong>Version:</strong> use a JFrog-supported PostgreSQL version (currently PostgreSQL 13–16 depending on release — confirm in the system requirements). UTF8 encoding is mandatory.</li>
+        <li><strong>Connections:</strong> set <code>max_connections</code> on the server to at least <strong>${totalConns.toLocaleString()}</strong> (Artifactory ${r.artiDbMaxConns}${r.xrayEnabled ? ` + Xray ${r.xrayDbMaxConns}` : ""}) plus headroom for this tier.</li>
+        <li><strong>Driver:</strong> JFrog bundles the PostgreSQL JDBC driver; for other engines (rarely supported) supply the driver JAR.</li>
+        ${r.dbMode === "colocated" && r.ha ? `<li><strong>HA:</strong> run a primary + synchronous standby (or Patroni / repmgr) with automatic failover; the sizing above provisions 2 DB nodes per service.</li>` : ""}
+        ${isAP ? `<li><strong>Active+Passive:</strong> run an independent database (or a cross-region read replica promoted on failover) at each site — size each site identically.</li>` : ""}
+        <li><strong>TLS:</strong> enable <code>sslmode=verify-full</code> in the JDBC URL for encrypted connections to the database.</li>
+      </ul>
+      <div class="hint">Reference: <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/configuring-the-database" target="_blank">JFrog — Configuring the Database (PostgreSQL)</a>.</div>
+    </details>
+  `;
+  }
+
+  /* External RabbitMQ — recommended sizing + plugins + configuration */
+  if (r.xrayEnabled && r.externalRMQ) {
+    const s = r.externalRmqSpec;
+    html += `
+    <details class="panel" open>
+      <summary style="font-size:14px;">External RabbitMQ — recommended sizing, plugins &amp; configuration</summary>
+      <div class="notice info" style="margin-top:10px;">
+        <strong>Recommended external cluster:</strong> ${s.replicas} × <code>${s.instance}</code> (${s.cpu} vCPU / ${s.memGB} GB, ${fmtGB(s.diskGB)} disk @ ${s.iops.toLocaleString()} IOPS each)${isAP ? " per site" : ""}. ${s.quorumNote} These nodes run on infrastructure you manage and are <strong>not</strong> counted in the platform footprint or Kubernetes cluster plan above.
+      </div>
+      <p style="margin:12px 0 4px;"><strong>Plugins to enable</strong> (<code>rabbitmq-plugins enable …</code>):</p>
+      <table>
+        <thead><tr><th>Plugin</th><th>Required?</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>rabbitmq_management</code></td><td><span class="chip danger">required</span></td><td>REST API + UI (port 15672) that Xray uses to create and inspect queues.</td></tr>
+          <tr><td><code>rabbitmq_management_agent</code></td><td><span class="chip warn">auto</span></td><td>Enabled automatically with the management plugin.</td></tr>
+          <tr><td>Quorum queues (core)</td><td><span class="chip ${r.ha ? "danger" : "warn"}">${r.ha ? "required (HA)" : "recommended"}</span></td><td>Built into RabbitMQ core (no plugin). Xray queues must use quorum type so they survive node loss.</td></tr>
+          <tr><td><code>rabbitmq_prometheus</code></td><td><span class="chip ok">recommended</span></td><td>Metrics endpoint for monitoring queue depth / consumer health.</td></tr>
+        </tbody>
+      </table>
+      <p style="margin:12px 0 4px;"><strong>Configuration checklist</strong>:</p>
+      <ul style="margin:4px 0 10px; padding-left:20px; color:var(--muted); font-size:13px; line-height:1.7;">
+        <li><strong>Version:</strong> match the RabbitMQ version bundled with your JFrog release (see the Xray system requirements / release notes) — mismatched majors are unsupported.</li>
+        <li><strong>vhost &amp; user:</strong> create a dedicated vhost and a user tagged <code>administrator</code> with full permissions (<code>configure / write / read = .* .* .*</code>) on that vhost.</li>
+        <li><strong>Quorum:</strong> deploy an <strong>odd</strong> number of nodes (1 / 3 / 5) with an identical Erlang cookie (<code>/var/lib/rabbitmq/.erlang.cookie</code>) so quorum queues can elect a majority.</li>
+        <li><strong>Ports:</strong> open <code>5672</code> (AMQP), <code>5671</code> (AMQPS/TLS), <code>15672</code> (management API) between JFrog ↔ RabbitMQ; and <code>25672</code> (inter-node) + <code>4369</code> (epmd) between RabbitMQ nodes.</li>
+        <li><strong>Disable the bundled broker</strong> and point JFrog at the external cluster in <code>system.yaml</code> (field names vary by version — confirm against the JFrog "external RabbitMQ" docs):
+          <blockquote style="white-space:pre; font-family:monospace; font-style:normal;">shared:
+  rabbitMq:
+    active: false
+    url: "amqp://&lt;rmq-host&gt;:5672"
+    username: "&lt;user&gt;"
+    password: "&lt;password&gt;"</blockquote>
+        </li>
+        <li><strong>Long-running scans:</strong> raise <code>consumer_timeout</code> (e.g. ≥ 30 min) so Xray scan messages aren't dropped mid-processing.</li>
+        <li><strong>TLS (optional):</strong> terminate AMQPS on <code>5671</code> with CA-signed certs for in-transit encryption.</li>
+        ${isAP ? `<li><strong>Active+Passive:</strong> run an independent external RabbitMQ cluster at each site (Xray does not replicate RMQ across sites) — the recommended size applies per site.</li>` : ""}
+      </ul>
+      <div class="hint">Externalizing RabbitMQ moves the messaging capacity off the JFrog nodes but does not eliminate it — size your external cluster at least as large as the recommendation above. The same applies to an external load balancer: it runs on its own (often managed/auto-scaled) infrastructure, which is why neither appears in the node totals.</div>
+      <div class="hint" style="margin-top:6px;">Reference: <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/external-rabbitmq" target="_blank">JFrog — Configuring an External RabbitMQ</a>.</div>
+    </details>
+  `;
+  }
+
+  /* External Valkey — recommended sizing + configuration */
+  if (r.svc.curation && r.externalValkey) {
+    const v = r.externalValkeySpec;
+    html += `
+    <details class="panel" open>
+      <summary style="font-size:14px;">External Valkey — recommended sizing &amp; configuration</summary>
+      <div class="notice info" style="margin-top:10px;">
+        <strong>Recommended external cache:</strong> ${v.replicas} × <code>${v.instance}</code> (${v.cpu} vCPU / ${v.memGB} GB, ${fmtGB(v.diskGB)} disk each)${isAP ? " per site" : ""}. ${v.replicas >= 3 ? "Odd node count for Sentinel/cluster quorum — tolerates 1 node failure." : "Single node — no failover."} Valkey (or Redis ≥ 7) backs the Catalog service; it runs on infrastructure you manage and is <strong>not</strong> counted in the platform footprint above.
+      </div>
+      <p style="margin:12px 0 4px;"><strong>Configuration checklist</strong>:</p>
+      <ul style="margin:4px 0 10px; padding-left:20px; color:var(--muted); font-size:13px; line-height:1.7;">
+        <li><strong>Engine:</strong> Valkey (or a compatible Redis ≥ 7) — a managed option (ElastiCache / Azure Cache for Redis / Memorystore) works too. Match the version in the Catalog system requirements.</li>
+        <li><strong>Memory:</strong> set <code>maxmemory</code> to ~75% of node RAM with <code>maxmemory-policy allkeys-lru</code>; the cache grows with the size of the indexed package catalog.</li>
+        <li><strong>HA:</strong> deploy an <strong>odd</strong> number of nodes (3/5) with Sentinel, or use cluster mode; expose a single endpoint to Catalog.</li>
+        <li><strong>Persistence:</strong> the Catalog cache is rebuildable — RDB snapshots are usually enough; enable AOF only if you want faster warm restarts.</li>
+        <li><strong>Ports:</strong> <code>6379</code> (Valkey/Redis), <code>6380</code> (TLS), <code>16379</code> (cluster bus) and <code>26379</code> (Sentinel) between Catalog ↔ Valkey and between Valkey nodes.</li>
+        <li><strong>Auth/TLS:</strong> set <code>requirepass</code> (or ACL users) and terminate TLS on <code>6380</code> with CA-signed certs.</li>
+        ${isAP ? `<li><strong>Active+Passive:</strong> run an independent Valkey cluster at each site — the recommended size applies per site.</li>` : ""}
+        <li><strong>Point Catalog at it</strong> in <code>system.yaml</code> (field names are version-specific — confirm against the Curation/Catalog docs):
+          <blockquote style="white-space:pre; font-family:monospace; font-style:normal;">catalog:
+  valkey:
+    url: "redis://&lt;valkey-host&gt;:6379"
+    password: "&lt;password&gt;"</blockquote>
+        </li>
+      </ul>
+      <div class="hint">Reference: <a href="https://jfrog.com/help/r/jfrog-curation-documentation/jfrog-curation" target="_blank">JFrog Curation</a> &middot; <a href="https://valkey.io/topics/" target="_blank">Valkey operations</a>.</div>
+    </details>
+  `;
+  }
+
+  /* Deployment artifacts (Helm values.yaml for K8s, Ansible bundle for VMs) */
+  html += buildArtifactPanel(r);
+
+  /* Reference */
+  html += `
+    <details>
+      <summary>How these numbers are derived</summary>
+      <p><strong>Effective tier</strong> = max of two inputs: active-clients tier (hardware sizing matrix: ≤20 Small, ≤100 Medium, ≤200 Large, &gt;200 contact support) and RPM tier (reference architecture: ≤6K Small, ≤50K Medium, ≤100K Large, ≤200K XLarge, ≤500K 2XLarge).</p>
+      <p><strong>Per-cloud instance types &amp; replica counts</strong> are verbatim from JFrog's <code>/reference-architecture/self-managed/deployment/sizing/{aws,azure,gcp}/</code> pages. Replicas by tier — Artifactory 1/2/3/4/6, Nginx and Xray 1/2/2/2/3, RabbitMQ 1/3/3/3/3, JAS 1/1/1/1/1.</p>
+      <p><strong>Storage sizing</strong> (disk, IOPS, throughput) is from the JFrog storage specification page: Artifactory 500→1000 GB, Xray 100→200 GB, RabbitMQ 100 GB, JAS 300 GB; Artifactory DB = 1/3 of filestore at 4K–20K IOPS; Xray DB 500–2500 GB at 4K–12K IOPS.</p>
+      <p><strong>Co-location</strong>: Distribution is co-located onto Artifactory nodes (no extra VMs, +200 GB to Artifactory disk). Artifactory, Nginx, Xray, JAS each require a dedicated VM per replica. RabbitMQ runs split (separate VMs) for Xray HA or &gt;100K artifacts.</p>
+      <p><strong>Optional services</strong> (Workers, AppTrust + UnifiedPolicy, Mission Control) come from the JFrog hardware sizing matrix (not the per-cloud reference architecture) — Workers 4/4/50, AppTrust &amp; UnifiedPolicy each 2/1/50, Mission Control 4/8/100.</p>
+      <p><strong>Onprem</strong>: JFrog does not publish a dedicated onprem sizing table, so this calculator mirrors the cloud CPU/RAM as generic VM sizes.</p>
+      <p><strong>VM vs Kubernetes</strong>: capacity numbers are identical — they describe the worker-node footprint either way. On Kubernetes, per-pod <code>requests</code>/<code>limits</code> come from the JFrog Helm chart sizing presets and are typically smaller than the full VM allocation.</p>
+    </details>
+  `;
+
+  document.getElementById("output").innerHTML = html;
+
+  const artifactBtn = document.getElementById("artifactBtn");
+  if (artifactBtn) artifactBtn.onclick = () => downloadArtifact(r);
+}
+
+/* ---------- Wire up ---------- */
+
+document.getElementById("calcBtn").addEventListener("click", calculate);
+document.getElementById("exportBtn").addEventListener("click", () => downloadCsv(lastResult));
+document.getElementById("inputs").addEventListener("change", calculate);
+document.getElementById("inputs").addEventListener("input", (e) => {
+  if (e.target.type === "number") calculate();
+});
+
+function paintRadioStates() {
+  document.querySelectorAll(".radio-group").forEach(group => {
+    group.querySelectorAll("label").forEach(lbl => {
+      const input = lbl.querySelector('input[type="radio"]');
+      lbl.classList.toggle("checked", input.checked);
+    });
+  });
+}
+document.addEventListener("change", paintRadioStates);
+paintRadioStates();
+toggleConditionalFields();
+calculate();

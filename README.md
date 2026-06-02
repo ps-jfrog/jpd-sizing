@@ -15,31 +15,29 @@ Sizing values are pulled verbatim from JFrog's published documentation:
 
 | File | What it does |
 |---|---|
-| [`index.html`](./index.html) | Baseline calculator. Inputs: cloud, deployment model, active clients, RPM, binary storage, Xray scale, HA, optional services, database. Outputs: per-component sizing, instance procurement list, co-location rules. |
-| [`ha-index.html`](./ha-index.html) | Same as `index.html` **plus** two additional features: (a) Kubernetes HA placement strategy (dedicated node pool vs `podAntiAffinity` on a shared pool) and (b) multi-cluster topology (single active vs Active+Passive DR with Hot/Warm passive scaling). When Active+Passive is chosen, the output renders two complete cluster sections and a grand total. |
-| [`common.css`](./common.css) | Shared styles for both pages. |
-| [`common.js`](./common.js) | Shared JFrog reference data (`REF_ARCH`, `REPLICAS`, `STORAGE`, …), tier helpers, and `fmtGB()` — the single source of truth so the two pages can't drift. Each page keeps its own `calculate()`/`render()`. |
+| [`index.html`](./index.html) | The calculator page — all inputs and the output panel. Thin: just markup + the `common.js`/`common.css` includes. |
+| [`common.js`](./common.js) | The whole application: JFrog reference data (`REF_ARCH`, `REPLICAS`, `STORAGE`, …), tier helpers, `calculate()`, `render()` (single **and** Active+Passive, VM **and** Kubernetes), the CSV exporter, and the Helm/Ansible artifact generators. |
+| [`common.css`](./common.css) | Shared styles. |
 
-No build, no server, no external dependencies — open either page directly in any modern browser. The shared `common.css`/`common.js` load via plain `<link>`/`<script src>` (works over `file://`), so keep the four files together.
+No build, no server, no external dependencies — open `index.html` directly in any modern browser. `common.css`/`common.js` load via plain `<link>`/`<script src>` (works over `file://`), so keep `index.html`, `common.css`, and `common.js` together.
 
 ```sh
-open index.html       # or
-open ha-index.html
+open index.html
 ```
 
 ---
 
 ## Inputs
 
-Both calculators accept these inputs (the second file adds two more, marked **\***):
+The calculator accepts these inputs (some are shown conditionally — e.g. Passive site scale only when Active+Passive, Kubernetes placement only when Kubernetes):
 
 | Input | Drives |
 |---|---|
 | **Target environment** — AWS / Azure / GCP / Private Datacenter | Per-cloud instance type catalog, storage class, network guidance |
 | **Deployment model** — Virtual Machines / Kubernetes | Per-component VM picks (for K8s these are worker-node recommendations) |
-| **\* Kubernetes placement** — Dedicated node pool / Anti-affinity (shared pool) | How Artifactory replicas are spread on K8s — `ha-index.html` only |
-| **\* Topology** — Single active cluster / Active + Passive (DR) | Whether a passive site is sized alongside the active — `ha-index.html` only |
-| **\* Passive site scale** — Hot (mirror) / Warm (minimal) | Replica count on the passive site — `ha-index.html` only |
+| **Kubernetes placement** — Dedicated node pool / Anti-affinity (shared pool) | How Artifactory replicas are spread on K8s (shown only for Kubernetes) |
+| **Topology** — Single active cluster / Active + Passive (DR) | Whether a passive site is sized alongside the active |
+| **Passive site scale** — Hot (mirror) / Warm (minimal) | Replica count on the passive site (shown only for Active+Passive) |
 | **Active concurrent clients** | Artifactory tier suggestion (≤20 Small, ≤100 Medium, ≤200 Large, >200 contact support) |
 | **Peak RPM** | Tier suggestion (≤6K Small, ≤50K Medium, ≤100K Large, ≤200K XLarge, ≤500K 2XLarge) and concurrent connection cap |
 | **Binary storage (TB)** | Object-storage backend size and Artifactory DB disk (= 1/3 of filestore) |
@@ -51,7 +49,7 @@ Both calculators accept these inputs (the second file adds two more, marked **\*
 | **RabbitMQ (Xray messaging)** — Bundled / External | External removes the RMQ nodes from the platform footprint (and the K8s worker plan). The results then show the recommended external cluster size plus the required plugins (`rabbitmq_management`, quorum queues, …) and a `system.yaml` configuration checklist |
 | **Optional services** — Distribution, JAS, Workers, AppTrust+UnifiedPolicy, Mission Control, Curation+Catalog | Adds (or co-locates) the corresponding components. Curation adds the Curation + Catalog services, a Catalog database, and a Valkey cache |
 | **Valkey (Curation/Catalog cache)** — Co-located / External *(shown only when Curation is selected)* | Co-located folds Valkey onto the Catalog nodes (+RAM, no new VMs); External removes it from the footprint and shows a recommended Valkey/Redis cluster size + configuration |
-| **Database** — Managed / Self-hosted PostgreSQL | DB instance name and replication note |
+| **Database** — Co-located (default) / External | Co-located = a PostgreSQL provisioned with the deployment (the Helm chart's bundled DB on K8s, or DB nodes alongside the platform on VMs) — counts toward the footprint and the K8s worker plan. External = any managed/standalone RDBMS run separately (RDS / Cloud SQL / Flexible Server / self-managed) — sized but outside the footprint. Drives the Helm mode: co-located → bundled `postgresql` + filesystem PVC; external → `postgresql.enabled: false` + per-service `database:` blocks + object-store binarystore |
 
 The effective tier is `max(client-implied, RPM-implied)`, computed on the growth-adjusted (projected) load. The chosen tier drives **every** per-component spec. The output summary shows the today → projected values whenever growth headroom is non-zero.
 
@@ -71,6 +69,11 @@ The effective tier is `max(client-implied, RPM-implied)`, computed on the growth
 - **External RabbitMQ setup** (when RMQ externalized) — recommended cluster size, required plugins, and a configuration checklist (vhost/user, quorum, ports, `system.yaml`). Links to the JFrog external-RabbitMQ docs.
 - **Derivation notes** — collapsible section explaining what's verbatim vs derived.
 - **Export to CSV** — the **⤓ Export to CSV** button (under *Calculate sizing*) downloads the full configuration as a multi-section CSV: inputs, aggregate footprint, the recommended binary store + alternatives, per-component sizing (with an Active/Passive site column), the Kubernetes cluster plan, the databases to create, and any external-service recommendations (RabbitMQ / Valkey). Filename: `jpd-sizing-<cloud>-<tier>-<date>.csv`. Pure client-side download — no server.
+- **Deployment artifacts** — a collapsible panel generated from the sizing, keyed to the deployment model:
+  - **Kubernetes** → a `values.yaml` for the unified `jfrog/jfrog-platform` Helm chart, modeled on the proven reference values in `jf-k8s/` (`helm-values-k8s.yaml` self-contained, `helm-values-k8s-external.yaml` external). The **Database** input selects the mode: *Co-located* → bundled PostgreSQL + filesystem PVC; *External* → external PostgreSQL + per-cloud object-store binarystore (`s3-storage-v3-direct` / `azure-blob-storage` / `google-storage-v2`). Component toggles (Curation/Catalog, JAS, AppTrust+UnifiedPolicy, Workers, Distribution, Mission Control) map to the chart's `extraSystemYaml` flags and top-level keys; NGINX on/off follows the ingress choice. **External RabbitMQ and external Valkey are layered on** (the reference files keep both bundled). Replicas/resources come from the sizing. Validated with `helm template` against the live chart. Plus `helm repo add`/`upgrade --install` commands and a **Download values.yaml** button.
+  - **Virtual Machines** → an Ansible bundle (`inventory.ini` grouped by role with counts from the sizing, a `site.yml` following the manual Linux-archive install, and a `system.yaml.j2` template wired for the external DB / HA / external RabbitMQ) plus a **Download Ansible bundle** button. (JFrog ships no single official Ansible collection; this is a manual-install scaffold.)
+
+  Both are **sizing-derived starting templates** with placeholder secrets — validate against your chart/installer version before use.
 
 ---
 
@@ -102,17 +105,14 @@ The Co-location panel quotes the JFrog rules verbatim:
 
 ---
 
-## Choosing between the two files
+## One page, all scenarios
 
-Use **`index.html`** if you want a quick single-cluster sizing for a stable workload.
+A single calculator (`index.html`) covers everything. For a quick single-cluster sizing, leave **Topology = Single active cluster** (the default). The advanced controls surface only when relevant:
 
-Use **`ha-index.html`** if you also need to:
+- **Kubernetes placement** (dedicated node pool vs anti-affinity on a shared pool) appears when you pick Kubernetes.
+- **Topology = Active + Passive (DR)** sizes a passive site (Hot mirror for instant failover, or Warm minimal that runs lean and scales up on failover) and renders per-site footprints plus a grand-total card.
 
-- Choose between dedicated K8s node pool vs anti-affinity on a shared pool (matters for cost / cluster ergonomics).
-- Size a DR setup with a passive site (Hot mirror for instant failover, or Warm minimal where the passive runs lean and scales up on failover).
-- See per-site footprints alongside a grand-total card.
-
-Both calculators share identical sizing logic for a single active cluster — the additions in `ha-index.html` only show up when you select Kubernetes or Active+Passive.
+> The former separate HA-only page (`ha-index.html`) was merged into this single page, so there's one implementation to maintain.
 
 ---
 
