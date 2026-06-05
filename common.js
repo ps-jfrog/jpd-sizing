@@ -1477,6 +1477,117 @@ function licenseEffectiveTier(r) {
   return licenseItems(r).reduce((m, it) => TIERS.indexOf(it.tier) > TIERS.indexOf(m) ? it.tier : m, "Pro");
 }
 
+/* =============================================================================
+   Deployment architecture diagram — a self-contained, dynamically generated SVG
+   (no dependencies, renders over file://). Reacts to cloud, deployment model,
+   topology, HA, and the selected products. Schematic: Region → VPC/VNet →
+   public/private subnets across AZs → component boxes → in-region managed
+   services, with a cross-region replication arrow for Active+Passive.
+   ============================================================================= */
+const DIAGRAM_REGIONS = {
+  aws:    { vpc:"VPC", az:"Availability Zones", k8s:"EKS", db:"RDS for PostgreSQL", obj:"Amazon S3", active:"Region us-east-1", passive:"Region us-west-2", lb:"ALB / NLB" },
+  azure:  { vpc:"VNet", az:"Availability Zones", k8s:"AKS", db:"Azure DB for PostgreSQL", obj:"Azure Blob Storage", active:"Region East US", passive:"Region West US", lb:"Application Gateway" },
+  gcp:    { vpc:"VPC network", az:"zones", k8s:"GKE", db:"Cloud SQL", obj:"Cloud Storage", active:"Region us-central1", passive:"Region us-west1", lb:"Cloud Load Balancing" },
+  onprem: { vpc:"Network / VLAN", az:"racks", k8s:"Kubernetes", db:"PostgreSQL (self-run)", obj:"S3-compatible store", active:"Primary datacenter", passive:"DR datacenter", lb:"External / hardware LB" }
+};
+
+function buildArchitectureDiagram(r) {
+  const esc = escapeHtml;
+  const C = { region:"#12151b", border:"#2a2f3a", accent:"#40bf6a", accentDim:"#2a8f4d", node:"#1f232c", lb:"#13251a", managed:"#171a21", txt:"#e6e8ee", muted:"#9aa3b2" };
+  const REG = DIAGRAM_REGIONS[r.cloud];
+  const isAP  = r.topology === "active-passive";
+  const isK8s = r.deployment === "k8s";
+  const azCount = r.ha ? 3 : 1;
+  const lbShort = r.externalLB ? REG.lb : "NGINX (reverse proxy)";
+
+  const boxW = 150, boxH = 46, gx = 12, gy = 12, COLS = 3, P = 16, bandGap = 16, pad = 8;
+  const contentW = COLS * boxW + (COLS - 1) * gx;
+  const regW = contentW + 2 * P;
+
+  const clip = (s, n) => s.length > n ? s.slice(0, n - 1) + "…" : s;
+  const T = (x, y, s, o = {}) => `<text x="${x}" y="${y}" fill="${o.fill || C.txt}" font-size="${o.size || 12}" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif"${o.weight ? ` font-weight="${o.weight}"` : ""}${o.anchor ? ` text-anchor="${o.anchor}"` : ""}>${esc(s)}</text>`;
+  const RECT = (x, y, w, h, fill, stroke, rx, dash) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${rx}" fill="${fill}" stroke="${stroke}" stroke-width="1"${dash ? ` stroke-dasharray="5 4"` : ""}/>`;
+  const cbox = (x, y, label, sub, kind) => {
+    const fill = kind === "lb" ? C.lb : kind === "managed" ? C.managed : C.node;
+    const stroke = kind === "lb" ? C.accent : kind === "managed" ? C.muted : C.border;
+    return RECT(x, y, boxW, boxH, fill, stroke, 6, kind === "managed")
+      + T(x + 10, y + 19, clip(label, 21), { weight: 600 })
+      + T(x + 10, y + 35, clip(sub, 27), { fill: C.muted, size: 10 });
+  };
+  const layout = (x, y, items, kind) => {
+    let s = "";
+    items.forEach((it, i) => { s += cbox(x + (i % COLS) * (boxW + gx), y + Math.floor(i / COLS) * (boxH + gy), it.label, it.sub, kind); });
+    const rows = Math.max(1, Math.ceil(items.length / COLS));
+    return { svg: s, endY: y + rows * boxH + (rows - 1) * gy };
+  };
+  const shortLabel = n => n
+    .replace(/^PostgreSQL \((.+?) DB\)$/, "PG · $1")
+    .replace(/^PostgreSQL \(shared\)$/, "PostgreSQL")
+    .replace(/ \(reverse proxy \/ TLS\)/, "")
+    .replace(/ \(Xray\)/, "")
+    .replace(/ \(server\)/, " server")
+    .replace(/ \(Xray Advanced Security\)/, "");
+  const compBoxes = comps => comps.map(c => ({ label: shortLabel(c.name), sub: `×${c.replicas} · ${c.cpu} vCPU / ${c.memGB} GB` }));
+
+  const managed = [{ label: REG.obj, sub: "binary store" }];
+  if (r.dbMode === "external") managed.push({ label: REG.db, sub: r.dbInstances === "dedicated" ? "dedicated per product" : "shared instance" });
+  if (r.externalRMQ && r.xrayEnabled) managed.push({ label: "RabbitMQ", sub: "external cluster" });
+  if (r.svc.curation && r.externalValkey) managed.push({ label: "Valkey", sub: "external cache" });
+
+  function regionSvg(x0, headerText, comps) {
+    const innerX = x0 + P;
+    const c = [];
+    const top = 6;
+    let y = top + 20;
+    c.push(T(x0 + 12, y, headerText, { size: 13, weight: 600 }));
+    y += 8;
+    const vpcTop = y;
+    y += 22;
+    c.push(T(innerX, y, `${REG.vpc} · 10.0.0.0/16`, { fill: C.muted, size: 11, weight: 600 })); y += 18;
+    c.push(T(innerX, y, "Public subnet", { fill: C.muted, size: 10 })); y += 14;
+    const lbItems = [{ label: lbShort, sub: "443 / 80" }];
+    if (r.cloud !== "onprem") lbItems.push({ label: "NAT gateway", sub: "egress" });
+    { const o = layout(innerX, y, lbItems, "lb"); c.push(o.svg); y = o.endY + bandGap; }
+    c.push(T(innerX, y, `${isK8s ? REG.k8s + " worker nodes" : "VM instances"} — private subnets across ${azCount} ${REG.az}`, { fill: C.muted, size: 10 })); y += 14;
+    { const o = layout(innerX, y, compBoxes(comps), "node"); c.push(o.svg); y = o.endY + bandGap; }
+    c.push(T(innerX, y, "In-region managed services", { fill: C.muted, size: 10 })); y += 14;
+    { const o = layout(innerX, y, managed, "managed"); c.push(o.svg); y = o.endY; }
+    const vpcBottom = y + 10;
+    const regBottom = vpcBottom + 10;
+    const rects = RECT(x0, top, regW, regBottom - top, C.region, C.border, 10)
+      + RECT(x0 + 8, vpcTop, regW - 16, vpcBottom - vpcTop, "none", C.accentDim, 8, true);
+    return { svg: rects + c.join(""), h: regBottom + top };
+  }
+
+  if (!isAP) {
+    const reg = regionSvg(pad, `${r.cloudLabel} · ${REG.active}`, r.components);
+    const W = regW + pad * 2, H = reg.h + pad;
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;height:auto;background:#0f1115;border-radius:8px;" xmlns="http://www.w3.org/2000/svg">${reg.svg}</svg>`;
+  }
+  const arrowGap = 96;
+  const r1 = regionSvg(pad, `${r.cloudLabel} · ${REG.active} (Active)`, r.components);
+  const x2 = pad + regW + arrowGap;
+  const r2 = regionSvg(x2, `${r.cloudLabel} · ${REG.passive} (Passive · ${r.passiveScale === "hot" ? "Hot mirror" : "Warm"})`, r.passiveComponents || r.components);
+  const H = Math.max(r1.h, r2.h) + pad, W = x2 + regW + pad;
+  const midY = Math.round(H / 2), ax1 = pad + regW, ax2 = x2;
+  const arrow = `<defs><marker id="jpd-ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="${C.accent}"/></marker></defs>`
+    + `<line x1="${ax1 + 6}" y1="${midY}" x2="${ax2 - 6}" y2="${midY}" stroke="${C.accent}" stroke-width="1.5" marker-end="url(#jpd-ah)"/>`
+    + T((ax1 + ax2) / 2, midY - 8, "Federation /", { fill: C.muted, size: 10, anchor: "middle" })
+    + T((ax1 + ax2) / 2, midY + 14, "replication", { fill: C.muted, size: 10, anchor: "middle" });
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;height:auto;background:#0f1115;border-radius:8px;" xmlns="http://www.w3.org/2000/svg">${arrow}${r1.svg}${r2.svg}</svg>`;
+}
+
+function buildDiagramPanel(r) {
+  return `
+    <details class="panel" open>
+      <summary style="font-size:14px;">Deployment architecture — ${r.cloudLabel}${r.topology === "active-passive" ? " (Active + Passive)" : ""}</summary>
+      <p style="margin:10px 0 8px; font-size:13px; color:var(--muted);">Schematic of the ${r.deployment === "k8s" ? "Kubernetes" : "VM"} deployment for the selected products. Component boxes show <em>name ×replicas</em>; dashed boxes are managed / external services.</p>
+      <div style="margin-top:8px;">${buildArchitectureDiagram(r)}</div>
+      <button class="export" id="diagramBtn">⤓ Download diagram (.svg)</button>
+      <div class="hint" style="margin-top:8px;">Schematic only — CIDRs and region names are illustrative. ${r.ha ? "HA replicas spread across multiple AZs/zones." : "Single-AZ (no HA)."} Managed / external services sit outside the subnets. Sensors (Runtime) run as a per-node DaemonSet and aren't drawn as separate boxes.</div>
+    </details>`;
+}
+
 function buildLicensePanel(r) {
   const items     = licenseItems(r);
   const effective = licenseEffectiveTier(r);
@@ -1620,6 +1731,9 @@ function render(r) {
   } else {
     html += footprintCard("Aggregate footprint", r.activeTotals);
   }
+
+  /* Deployment architecture diagram */
+  html += buildDiagramPanel(r);
 
   /* Kubernetes cluster plan — group component node recommendations into node pools.
      Cluster capacity adds ~15% headroom for kubelet/OS/CNI and system DaemonSets. */
@@ -2022,6 +2136,9 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
 
   const artifactBtn = document.getElementById("artifactBtn");
   if (artifactBtn) artifactBtn.onclick = () => downloadArtifact(r);
+
+  const diagramBtn = document.getElementById("diagramBtn");
+  if (diagramBtn) diagramBtn.onclick = () => downloadText(`jpd-architecture-${r.cloud}-${new Date().toISOString().slice(0, 10)}.svg`, buildArchitectureDiagram(r), "image/svg+xml");
 }
 
 /* ---------- Wire up ---------- */
