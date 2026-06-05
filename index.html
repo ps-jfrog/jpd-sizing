@@ -50,11 +50,12 @@
 
     <div class="field">
       <label>Topology</label>
-      <div class="radio-group" data-name="topology">
+      <div class="radio-group quad" data-name="topology">
         <label><input type="radio" name="topology" value="single" checked /> Single active cluster</label>
         <label><input type="radio" name="topology" value="active-passive" /> Active + Passive (DR)</label>
+        <label><input type="radio" name="topology" value="active-active" /> Active + Active</label>
       </div>
-      <div class="hint">Single sizes one active cluster. Active + Passive also sizes a DR site (scaled by the passive option below) and reports a grand total across both sites.</div>
+      <div class="hint">Single sizes one active cluster. Active + Passive adds a DR site (scaled by the passive option below). Active + Active adds a second full active site (both serve traffic, bidirectional federation). Both multi-site options report per-site footprints + a grand total.</div>
     </div>
 
     <div class="field" id="passiveScaleField" style="display:none;">

@@ -36,8 +36,8 @@ The calculator accepts these inputs (some are shown conditionally — e.g. Passi
 | **Target environment** — AWS / Azure / GCP / Private Datacenter | Per-cloud instance type catalog, storage class, network guidance |
 | **Deployment model** — Virtual Machines / Kubernetes | Per-component VM picks (for K8s these are worker-node recommendations) |
 | **Kubernetes placement** — Dedicated node pool / Anti-affinity (shared pool) | How Artifactory replicas are spread on K8s (shown only for Kubernetes) |
-| **Topology** — Single active cluster / Active + Passive (DR) | Whether a passive site is sized alongside the active |
-| **Passive site scale** — Hot (mirror) / Warm (minimal) | Replica count on the passive site (shown only for Active+Passive) |
+| **Topology** — Single active cluster / Active + Passive (DR) / Active + Active | Single sizes one cluster. Active + Passive adds a DR site (scaled by the passive option). **Active + Active** adds a second *full* active site (both serve traffic) with bidirectional Federation + Access Federation and a global LB/GSLB. Both multi-site options report per-site footprints + a grand total |
+| **Passive site scale** — Hot (mirror) / Warm (minimal) | Replica count on the passive site (shown only for Active+Passive; Active+Active is always a full mirror) |
 | **Active concurrent clients** | Artifactory tier suggestion (≤20 Small, ≤100 Medium, ≤200 Large, >200 contact support) |
 | **Peak RPM** | Tier suggestion (≤6K Small, ≤50K Medium, ≤100K Large, ≤200K XLarge, ≤500K 2XLarge) and concurrent connection cap |
 | **Binary storage (TB)** | Object-storage backend size and Artifactory DB disk (= 1/3 of filestore) |
@@ -116,6 +116,7 @@ A single calculator (`index.html`) covers everything. For a quick single-cluster
 
 - **Kubernetes placement** (dedicated node pool vs anti-affinity on a shared pool) appears when you pick Kubernetes.
 - **Topology = Active + Passive (DR)** sizes a passive site (Hot mirror for instant failover, or Warm minimal that runs lean and scales up on failover) and renders per-site footprints plus a grand-total card.
+- **Topology = Active + Active** sizes a second *full* active site (both serve traffic), with bidirectional Federation + Access Federation and a global LB/GSLB across both sites; per-site footprints + grand total, and the diagram shows two regions with a two-way replication arrow.
 
 > The former separate HA-only page (`ha-index.html`) was merged into this single page, so there's one implementation to maintain.
 
