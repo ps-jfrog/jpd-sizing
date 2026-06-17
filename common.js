@@ -496,6 +496,20 @@ function buildSizingCsv(r) {
     blank();
   }
 
+  /* Licensing */
+  const lic = licenseCount(r);
+  row("[LICENSING]");
+  row("Field", "Value");
+  row("Minimum subscription tier", lic.tier);
+  if (lic.jas) row("Add-on", "JFrog Advanced Security (JAS)");
+  if (isMulti) {
+    row(`Artifactory licenses — ${siteA}`, lic.active);
+    row(`Artifactory licenses — ${siteB}`, lic.passive);
+  }
+  row("Artifactory licenses — total", lic.total);
+  if (lic.edge) row("Distribution Edge", "Edge nodes carry separate Edge licenses");
+  blank();
+
   return L.join("\r\n");
 }
 
@@ -1504,6 +1518,23 @@ function licenseEffectiveTier(r) {
   const TIERS = ["Pro", "Enterprise X", "Enterprise+"];
   return licenseItems(r).reduce((m, it) => TIERS.indexOf(it.tier) > TIERS.indexOf(m) ? it.tier : m, "Pro");
 }
+// How many JFrog licenses this configuration consumes. JPD is licensed per
+// Artifactory node (one license per HA node, per site); other JPD services are
+// entitlements within the subscription, not separately-licensed servers. Edge
+// (Distribution) nodes carry their own Edge licenses.
+function licenseCount(r) {
+  const arti = findComp(r, "Artifactory");
+  const active  = arti ? arti.replicas : 1;
+  const passive = (r.passiveComponents || []).filter(c => c.name === "Artifactory").reduce((s, c) => s + c.replicas, 0);
+  return {
+    tier:    licenseEffectiveTier(r),
+    active,
+    passive,
+    total:   active + passive,
+    jas:     !!r.svc.jas,
+    edge:    !!r.svc.distribution
+  };
+}
 
 /* =============================================================================
    Deployment architecture diagram — a self-contained, dynamically generated SVG
@@ -1622,14 +1653,14 @@ function buildDiagramPanel(r) {
 
 function buildLicensePanel(r) {
   const items     = licenseItems(r);
-  const effective = licenseEffectiveTier(r);
+  const lic       = licenseCount(r);
+  const effective = lic.tier;
   const effClass  = effective === "Enterprise+" ? "danger" : effective === "Enterprise X" ? "warn" : "ok";
 
-  // Artifactory licenses consumed = one per Artifactory node (per HA node, per site).
-  const arti = findComp(r, "Artifactory");
-  const activeArti = arti ? arti.replicas : 1;
-  const passiveArti = (r.passiveComponents || []).filter(c => c.name === "Artifactory").reduce((s, c) => s + c.replicas, 0);
-  const totalArti = activeArti + passiveArti;
+  const totalArti = lic.total;
+  const splitNote = r.topology === "active-passive" ? ` (${lic.active} active + ${lic.passive} passive)`
+                  : r.topology === "active-active"  ? ` (${lic.active} site A + ${lic.passive} site B)`
+                  : "";
 
   const rows = items.map(it => {
     const cls = it.tier === "Enterprise+" ? "danger" : it.tier === "Enterprise X" ? "warn" : "ok";
@@ -1638,17 +1669,21 @@ function buildLicensePanel(r) {
 
   return `
     <details class="panel">
-      <summary style="font-size:14px;">Licensing — minimum subscription: ${effective}</summary>
+      <summary style="font-size:14px;">Licensing — minimum subscription: ${effective} · ${totalArti} Artifactory license${totalArti === 1 ? "" : "s"}</summary>
       <div class="notice ${effClass}" style="margin-top:10px;">
         <strong>Minimum subscription for this configuration: ${effective}.</strong>
         ${r.svc.jas ? " Plus the <strong>JFrog Advanced Security</strong> add-on (on top of the Xray entitlement)." : ""}
         One subscription licenses the whole JFrog Platform Deployment (JPD) — Xray, Distribution, Mission Control, etc. are entitlements within that tier, not separately-licensed servers.
       </div>
+      <div class="notice ${effClass}" style="margin-top:10px;">
+        <strong>Licenses needed for this configuration: ${totalArti} Artifactory node license${totalArti === 1 ? "" : "s"}${splitNote}.</strong>
+        JPD is licensed per Artifactory node — one license per HA node, per site.${lic.edge ? " Distribution Edge nodes carry their own <strong>Edge licenses</strong> (counted separately)." : ""}
+      </div>
       <table>
         <thead><tr><th>Product / capability</th><th>Min. subscription</th><th>Notes</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
-      <div class="hint" style="margin-top:10px;"><strong>License count:</strong> HA consumes one Artifactory license per node — this deployment uses <strong>${totalArti}</strong> Artifactory license${totalArti === 1 ? "" : "s"}${r.topology === "active-passive" ? ` (${activeArti} active + ${passiveArti} passive)` : r.topology === "active-active" ? ` (${activeArti} site A + ${passiveArti} site B)` : ""} from your license bucket.${r.svc.distribution ? " Distribution Edge nodes are licensed separately (Edge licenses)." : ""}</div>
+      <div class="hint" style="margin-top:10px;"><strong>License count:</strong> HA consumes one Artifactory license per node — this deployment uses <strong>${totalArti}</strong> Artifactory license${totalArti === 1 ? "" : "s"}${splitNote} from your license bucket.${r.svc.distribution ? " Distribution Edge nodes are licensed separately (Edge licenses)." : ""}</div>
       <div class="hint" style="margin-top:6px;"><strong>How it's applied:</strong> ${r.deployment === "k8s"
         ? "supply the license to the Helm chart via a Secret (<code>artifactory.license.secret</code> / <code>licenseKey</code>) or post-install through the UI / Access API."
         : "drop <code>artifactory.lic</code> into <code>$JFROG_HOME/artifactory/var/etc/artifactory/</code> (or apply via the UI / Access API) at install time."}</div>
