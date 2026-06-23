@@ -346,22 +346,19 @@ function fmtGB(n) {
 }
 
 /* =============================================================================
-   CSV export. buildSizingCsv(r) serializes a render() result object into a
-   multi-section CSV. It introspects r, so it works for both single-cluster and
-   Active+Passive results.
+   XLSX export. buildSizingXlsx(r) creates a multi-sheet workbook using SheetJS
+   (window.XLSX, loaded from CDN). Sheets:
+     1. Inputs          — form settings / projections
+     2. Summary         — aggregate footprint + Kubernetes cluster plan
+     3. Components      — per-component sizing table
+     4. Databases       — DB products and instance sizing
+     5. Binary Store    — JFrog-recommended filestore options
+     6. Licensing       — license counts
+     7. External Svcs   — (conditional) external RabbitMQ / Valkey specs
    ============================================================================= */
 
-function csvEscape(v) {
-  if (v == null) v = "";
-  v = String(v);
-  return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
-}
-
-function buildSizingCsv(r) {
-  const L = [];
-  const row = (...cells) => L.push(cells.map(csvEscape).join(","));
-  const blank = () => L.push("");
-
+function buildSizingXlsx(r) {
+  const XLSX = window.XLSX;
   const deployLabel = r.deployment === "k8s" ? "Kubernetes" : "Virtual Machines";
   const isAP = r.topology === "active-passive";
   const isAA = r.topology === "active-active";
@@ -369,31 +366,30 @@ function buildSizingCsv(r) {
   const siteA = isAA ? "Site A" : "Active";
   const siteB = isAA ? "Site B" : "Passive";
 
-  row("JFrog Platform Deployment (JPD) Sizing — Export");
-  row("Generated", new Date().toISOString());
-  blank();
+  const wb = XLSX.utils.book_new();
+  const addSheet = (name, rows) =>
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), name);
 
-  /* Inputs */
-  row("[INPUTS]");
-  row("Field", "Value");
-  row("Target environment", r.cloudLabel);
-  row("Deployment model", deployLabel);
-  if (r.topology) row("Topology", isAA ? "Active + Active" : isAP ? "Active + Passive (DR)" : "Single active cluster");
-  if (isAP) row("Passive site scale", r.passiveScale === "hot" ? "Hot (mirror)" : "Warm (minimal)");
-  if (r.deployment === "k8s" && r.k8sPlacement) row("Kubernetes placement", r.k8sPlacement === "antiaffinity" ? "Anti-affinity (shared pool)" : "Dedicated node pool");
-  row("Effective tier", String(r.tier || "").toUpperCase());
-  row("Peak concurrent connections", `${r.activeClientsInput} → ${r.activeClients} (projected)`);
-  row("Peak RPM", `${r.rpmInput} → ${r.rpm} (projected)`);
-  row("Binary storage (TB)", `${r.binaryTBInput} → ${r.binaryTB} (projected)`);
-  row("Planned growth headroom (%)", r.growthPct);
-  row("Indexed artifacts (Xray)", r.xrayEnabled ? `${r.xrayArtifactsInput} → ${r.xrayArtifacts} (projected)` : "No Xray");
-  row("Local cache-fs", r.cacheFsGB > 0 ? `${r.cacheFsPct}% of binaries (${fmtGB(r.cacheFsGB)}/node)` : "Disabled");
-  row("High Availability", r.ha ? "Yes (multi-replica)" : "No (single replica)");
-  row("Load balancer", r.externalLB ? r.lbDisplay : "None");
-  row("NGINX tier provisioned", r.provisionNginx ? "Yes" : "No");
-  row("RabbitMQ", !r.xrayEnabled ? "N/A (no Xray)" : (r.externalRMQ ? "External" : "Bundled"));
-  row("Database", r.dbMode === "external" ? "External (managed/standalone RDBMS)" : "Co-located (provisioned with the deployment)");
-  row("Database instances", r.dbInstances === "dedicated" ? "Dedicated (one instance per product)" : "Shared (one instance, a logical DB per product)");
+  /* ---- Sheet 1: Inputs ---- */
+  const inputs = [["Field", "Value"]];
+  inputs.push(["Target environment", r.cloudLabel]);
+  inputs.push(["Deployment model", deployLabel]);
+  if (r.topology) inputs.push(["Topology", isAA ? "Active + Active" : isAP ? "Active + Passive (DR)" : "Single active cluster"]);
+  if (isAP) inputs.push(["Passive site scale", r.passiveScale === "hot" ? "Hot (mirror)" : "Warm (minimal)"]);
+  if (r.deployment === "k8s" && r.k8sPlacement) inputs.push(["Kubernetes placement", r.k8sPlacement === "antiaffinity" ? "Anti-affinity (shared pool)" : "Dedicated node pool"]);
+  inputs.push(["Effective tier", String(r.tier || "").toUpperCase()]);
+  inputs.push(["Peak concurrent connections (projected)", r.activeClients]);
+  inputs.push(["Peak RPM (projected)", r.rpm]);
+  inputs.push(["Binary storage TB (projected)", r.binaryTB]);
+  inputs.push(["Planned growth headroom (%)", r.growthPct]);
+  inputs.push(["Indexed artifacts — Xray (projected)", r.xrayEnabled ? r.xrayArtifacts : "No Xray"]);
+  inputs.push(["Local cache-fs", r.cacheFsGB > 0 ? `${r.cacheFsPct}% of binaries (${fmtGB(r.cacheFsGB)}/node)` : "Disabled"]);
+  inputs.push(["High Availability", r.ha ? "Yes" : "No"]);
+  inputs.push(["Load balancer", r.externalLB ? r.lbDisplay : "None"]);
+  inputs.push(["NGINX tier provisioned", r.provisionNginx ? "Yes" : "No"]);
+  inputs.push(["RabbitMQ", !r.xrayEnabled ? "N/A (no Xray)" : (r.externalRMQ ? "External" : "Bundled")]);
+  inputs.push(["Database", r.dbMode === "external" ? "External" : "Co-located"]);
+  inputs.push(["Database instances", r.dbInstances === "dedicated" ? "Dedicated (one instance per product)" : "Shared (one instance, logical DBs)"]);
   const svcList = [];
   if (r.svc.distribution) svcList.push("Distribution");
   if (r.svc.jas) svcList.push("JAS");
@@ -402,117 +398,126 @@ function buildSizingCsv(r) {
   if (r.svc.missionControl) svcList.push("Mission Control");
   if (r.svc.curation) svcList.push("Curation + Catalog");
   if (r.svc.runtime) svcList.push("Runtime Security");
-  row("Optional services", svcList.join("; ") || "None");
-  if (r.svc.curation) row("Valkey", r.externalValkey ? "External" : "Co-located");
-  blank();
+  inputs.push(["Optional services", svcList.join("; ") || "None"]);
+  if (r.svc.curation) inputs.push(["Valkey", r.externalValkey ? "External" : "Co-located"]);
+  addSheet("Inputs", inputs);
 
-  /* Totals (computed from components so it works for either page shape) */
+  /* ---- Sheet 2: Summary (Aggregate Footprint + Cluster Plan) ---- */
   const totalsOf = comps => comps.reduce((t, c) => ({
-    nodes: t.nodes + c.replicas, cpu: t.cpu + c.cpu * c.replicas,
-    mem: t.mem + c.memGB * c.replicas, disk: t.disk + c.diskGB * c.replicas
+    nodes: t.nodes + c.replicas,
+    cpu:   t.cpu  + c.cpu   * c.replicas,
+    mem:   t.mem  + c.memGB * c.replicas,
+    disk:  t.disk + c.diskGB * c.replicas
   }), { nodes: 0, cpu: 0, mem: 0, disk: 0 });
-  const active = totalsOf(r.components);
+  const active  = totalsOf(r.components);
   const passive = r.passiveComponents ? totalsOf(r.passiveComponents) : null;
 
-  row("[AGGREGATE FOOTPRINT]");
-  row("Scope", "Nodes", "vCPU", "RAM (GB)", "Service disk (GB)");
+  const summary = [
+    ["Deployment Summary"],
+    [],
+    ["Scope", "Nodes", r.cpuLabel, "RAM (GB)", "Service Disk (GB)"]
+  ];
   if (isMulti && passive) {
-    row(siteA + " site", active.nodes, active.cpu, active.mem, active.disk);
-    row(siteB + " site", passive.nodes, passive.cpu, passive.mem, passive.disk);
-    row("Grand total", active.nodes + passive.nodes, active.cpu + passive.cpu, active.mem + passive.mem, active.disk + passive.disk);
+    summary.push([siteA + " site",   active.nodes,                   active.cpu,                   active.mem,                   active.disk]);
+    summary.push([siteB + " site",   passive.nodes,                  passive.cpu,                  passive.mem,                  passive.disk]);
+    summary.push(["Grand total",     active.nodes + passive.nodes,   active.cpu + passive.cpu,     active.mem + passive.mem,     active.disk + passive.disk]);
   } else {
-    row("Total", active.nodes, active.cpu, active.mem, active.disk);
+    summary.push(["Total",           active.nodes,                   active.cpu,                   active.mem,                   active.disk]);
   }
-  row("Binary / artifact storage (TB)", isMulti ? r.binaryTB * 2 : r.binaryTB);
-  blank();
+  summary.push(["Binary / artifact storage (TB)", isMulti ? r.binaryTB * 2 : r.binaryTB, "", "", ""]);
 
-  /* Binary store recommendation (JFrog-preferred filestore for the cloud) */
-  const bs = BINARY_STORE[r.cloud];
-  if (bs) {
-    row(`[BINARY STORE — JFrog recommended for ${r.cloudLabel}]`);
-    row("Option", "Recommended", "binarystore.xml template", "Notes");
-    row(bs.best.name, "Yes (best)", bs.best.template, bs.best.note);
-    bs.alternatives.forEach(a => row(a.name, "No", a.template, a.note));
-    blank();
-  }
-
-  /* Per-component sizing */
-  row("[PER-COMPONENT SIZING]");
-  row("Site", "Component", "Replicas", "vCPU (each)", "RAM GB (each)", "Disk GB (each)", "IOPS", "Instance / VM", "Total vCPU", "Total RAM (GB)", "Total disk (GB)", "Notes");
-  const compRows = (comps, site) => comps.forEach(c =>
-    row(site, c.name, c.replicas, c.cpu, c.memGB, c.diskGB, c.iops, c.instance, c.cpu * c.replicas, c.memGB * c.replicas, c.diskGB * c.replicas, c.note));
-  compRows(r.components, isMulti ? siteA : "—");
-  if (isMulti && r.passiveComponents) compRows(r.passiveComponents, siteB);
-  blank();
-
-  /* Kubernetes cluster plan */
   if (r.deployment === "k8s") {
     const externalDb = r.dbMode === "external";
-    const planFor = comps => {
+    const clusterPlan = comps => {
       const workers = comps.filter(c => !(externalDb && c.name.startsWith("PostgreSQL")));
       const pools = {};
-      workers.forEach(c => { (pools[c.instance] = pools[c.instance] || { cpu: c.cpu, memGB: c.memGB, count: 0 }).count += c.replicas; });
+      workers.forEach(c => {
+        if (!pools[c.instance]) pools[c.instance] = { cpu: c.cpu, memGB: c.memGB, count: 0, usedBy: [] };
+        pools[c.instance].count += c.replicas;
+        pools[c.instance].usedBy.push(c.name + (c.replicas > 1 ? ` ×${c.replicas}` : ""));
+      });
       const nodes = Object.values(pools).reduce((s, p) => s + p.count, 0);
-      const cpu = Object.values(pools).reduce((s, p) => s + p.cpu * p.count, 0);
-      const mem = Object.values(pools).reduce((s, p) => s + p.memGB * p.count, 0);
+      const cpu   = Object.values(pools).reduce((s, p) => s + p.cpu   * p.count, 0);
+      const mem   = Object.values(pools).reduce((s, p) => s + p.memGB * p.count, 0);
       return { pools, nodes, cpu, mem, clusterCpu: Math.ceil(cpu * 1.15), clusterMem: Math.ceil(mem * 1.15) };
     };
-    row("[KUBERNETES CLUSTER PLAN]");
-    row("Site", "Node pool (VM)", "vCPU", "RAM (GB)", "Nodes");
-    const planSection = (comps, site) => {
-      const p = planFor(comps);
-      Object.entries(p.pools).sort((a, b) => b[1].count - a[1].count).forEach(([inst, info]) => row(site, inst, info.cpu, info.memGB, info.count));
-      row(site + " — total worker capacity", "", p.cpu, p.mem, p.nodes);
-      row(site + " — provision (incl. ~15% sys)", "", p.clusterCpu, p.clusterMem, "");
+    const addClusterPlan = (comps, site) => {
+      const p = clusterPlan(comps);
+      Object.entries(p.pools).sort((a, b) => b[1].count - a[1].count)
+        .forEach(([inst, info]) => summary.push([site, inst, info.cpu, info.memGB, info.count, info.usedBy.join(", ")]));
+      summary.push([site + " — worker capacity",             "", p.cpu,        p.mem,        p.nodes, ""]);
+      summary.push([site + " — provision (incl. ~15% sys)", "", p.clusterCpu, p.clusterMem, "",       ""]);
     };
-    planSection(r.components, isMulti ? siteA : "Cluster");
-    if (isMulti && r.passiveComponents) planSection(r.passiveComponents, siteB);
-    blank();
+    summary.push([], [], ["Kubernetes Cluster Plan"], [],
+      ["Site", "Node Pool (VM size)", r.cpuLabel, "RAM (GB)", "Nodes", "Runs"]);
+    addClusterPlan(r.components, isMulti ? siteA : "Cluster");
+    if (isMulti && r.passiveComponents) addClusterPlan(r.passiveComponents, siteB);
+  }
+  addSheet("Summary", summary);
+
+  /* ---- Sheet 3: Components ---- */
+  const compRows = [
+    ["Site", "Component", "Replicas", `${r.cpuLabel} (each)`, "RAM GB (each)", "Disk GB (each)",
+     "IOPS", "Instance / VM", `Total ${r.cpuLabel}`, "Total RAM (GB)", "Total Disk (GB)", "Notes"]
+  ];
+  const pushComps = (comps, site) => comps.forEach(c =>
+    compRows.push([site, c.name, c.replicas, c.cpu, c.memGB, c.diskGB, c.iops, c.instance,
+                   c.cpu * c.replicas, c.memGB * c.replicas, c.diskGB * c.replicas, c.note]));
+  pushComps(r.components, isMulti ? siteA : "—");
+  if (isMulti && r.passiveComponents) pushComps(r.passiveComponents, siteB);
+  addSheet("Components", compRows);
+
+  /* ---- Sheet 4: Databases ---- */
+  const dbMode = r.dbMode === "external" ? "External" : "Co-located";
+  const dbRows = [["Service", "Database", "User", "Mode"]];
+  dbRows.push(["Artifactory", "artifactory", "artifactory", dbMode]);
+  if (r.xrayEnabled) dbRows.push([`Xray${r.svc.jas ? " + JAS" : ""}`, "xraydb", "xray", dbMode]);
+  if (r.svc.distribution) dbRows.push(["Distribution", "distribution", "distribution", dbMode]);
+  if (r.svc.curation)     dbRows.push(["Catalog (Curation)", "catalogdb", "catalog", dbMode]);
+  if (r.svc.runtime)      dbRows.push(["Runtime Security", "runtime", "runtime", dbMode]);
+  if (r.dbProducts && r.dbProducts.length) {
+    dbRows.push([], ["Instance sizing"], [],
+      ["Instance / VM", r.cpuLabel, "RAM (GB)", "Disk (GB)", "IOPS", "Max connections", "Serves"]);
+    r.dbProducts.forEach(d =>
+      dbRows.push([d.instance, d.cpu, d.memGB, d.diskGB, d.iops, d.maxConns, d.label]));
+  }
+  addSheet("Databases", dbRows);
+
+  /* ---- Sheet 5: Binary Store ---- */
+  const bs = BINARY_STORE[r.cloud];
+  if (bs) {
+    const bsRows = [["Option", "Recommended", "binarystore.xml template", "Notes"]];
+    bsRows.push([bs.best.name, "Yes (best)", bs.best.template, bs.best.note]);
+    bs.alternatives.forEach(a => bsRows.push([a.name, "No", a.template, a.note]));
+    addSheet("Binary Store", bsRows);
   }
 
-  /* Databases */
-  row("[DATABASES]");
-  row("Service", "Database", "User", "Mode");
-  const mode = r.dbMode === "external" ? "External" : "Co-located";
-  row("Artifactory", "artifactory", "artifactory", mode);
-  if (r.xrayEnabled) row(`Xray${r.svc.jas ? " + JAS" : ""}`, "xraydb", "xray", mode);
-  if (r.svc.distribution) row("Distribution", "distribution", "distribution", mode);
-  if (r.svc.curation) row("Catalog (Curation)", "catalogdb", "catalog", mode);
-  if (r.svc.runtime) row("Runtime Security", "runtime", "runtime", mode);
-  blank();
+  /* ---- Sheet 6: Licensing ---- */
+  const lic = licenseCount(r);
+  const licRows = [["Field", "Value"]];
+  licRows.push(["Minimum subscription tier", lic.tier]);
+  if (lic.jas) licRows.push(["Add-on", "JFrog Advanced Security (JAS)"]);
+  if (isMulti) {
+    licRows.push([`Artifactory licenses — ${siteA}`, lic.active]);
+    licRows.push([`Artifactory licenses — ${siteB}`, lic.passive]);
+  }
+  licRows.push(["Artifactory licenses — total", lic.total]);
+  if (lic.edge) licRows.push(["Distribution Edge", "Edge nodes carry separate Edge licenses"]);
+  addSheet("Licensing", licRows);
 
-  /* External services (recommended, not in footprint) */
-  const ext = [];
+  /* ---- Sheet 7: External Services (only when present) ---- */
+  const extRows = [["Service", "Cluster / Nodes", "Per-node spec", "Disk"]];
   if (r.xrayEnabled && r.externalRMQ && r.externalRmqSpec) {
     const s = r.externalRmqSpec;
-    ext.push(["RabbitMQ", `${s.replicas} × ${s.instance}`, `${s.cpu} vCPU / ${s.memGB} GB`, fmtGB(s.diskGB)]);
+    extRows.push(["RabbitMQ", `${s.replicas} × ${s.instance}`, `${s.cpu} ${r.cpuLabel} / ${s.memGB} GB`, fmtGB(s.diskGB)]);
   }
   if (r.svc.curation && r.externalValkey && r.externalValkeySpec) {
     const v = r.externalValkeySpec;
-    ext.push(["Valkey", `${v.replicas} × ${v.instance}`, `${v.cpu} vCPU / ${v.memGB} GB`, fmtGB(v.diskGB)]);
+    extRows.push(["Valkey", `${v.replicas} × ${v.instance}`, `${v.cpu} ${r.cpuLabel} / ${v.memGB} GB`, fmtGB(v.diskGB)]);
   }
-  if (ext.length) {
-    row("[EXTERNAL SERVICES — recommended, provisioned separately]");
-    row("Service", "Cluster", "Per-node spec", "Disk");
-    ext.forEach(e => row(...e));
-    blank();
-  }
+  if (extRows.length > 1) addSheet("External Services", extRows);
 
-  /* Licensing */
-  const lic = licenseCount(r);
-  row("[LICENSING]");
-  row("Field", "Value");
-  row("Minimum subscription tier", lic.tier);
-  if (lic.jas) row("Add-on", "JFrog Advanced Security (JAS)");
-  if (isMulti) {
-    row(`Artifactory licenses — ${siteA}`, lic.active);
-    row(`Artifactory licenses — ${siteB}`, lic.passive);
-  }
-  row("Artifactory licenses — total", lic.total);
-  if (lic.edge) row("Distribution Edge", "Edge nodes carry separate Edge licenses");
-  blank();
-
-  return L.join("\r\n");
+  return wb;
 }
 
 function downloadText(filename, content, mime) {
@@ -527,9 +532,15 @@ function downloadText(filename, content, mime) {
   URL.revokeObjectURL(url);
 }
 
-function downloadCsv(r) {
+function downloadXlsx(r) {
   if (!r) return;
-  downloadText(`jpd-sizing-${r.cloud}-${r.tier}-${new Date().toISOString().slice(0, 10)}.csv`, buildSizingCsv(r), "text/csv");
+  const XLSX = window.XLSX;
+  if (!XLSX) {
+    alert("SheetJS not loaded — check your internet connection and reload the page.");
+    return;
+  }
+  const wb = buildSizingXlsx(r);
+  XLSX.writeFile(wb, `jfrog-site-sizing-${r.cloud}-${r.tier}-${new Date().toISOString().slice(0, 10)}.xlsx`);
 }
 
 /* =============================================================================
@@ -653,7 +664,7 @@ function buildHelmValues(r) {
 
   // ── Header ────────────────────────────────────────────────────────────────
   p("# JFrog Platform — Helm values for the jfrog/jfrog-platform chart.");
-  p("# Generated by the JPD Sizing Calculator, aligned with jf-k8s/ reference values:");
+  p("# Generated by the JFrog Platform Site Sizing Calculator, aligned with jf-k8s/ reference values:");
   p("#   helm-values-k8s.yaml (bundled)  &  helm-values-k8s-external.yaml (external).");
   p("# MODE: " + (external
     ? "EXTERNAL — external PostgreSQL + object-store binarystore."
@@ -1563,7 +1574,7 @@ function buildAnsibleInventory(r) {
   const L = [];
   const group = (name, comp, n) => {
     if (!n) return;
-    L.push("[" + name + "]" + (comp ? "   # " + comp.cpu + " vCPU / " + comp.memGB + " GB each" : ""));
+    L.push("[" + name + "]" + (comp ? "   # " + comp.cpu + " " + r.cpuLabel + " / " + comp.memGB + " GB each" : ""));
     for (let i = 1; i <= n; i++) L.push(name + "-" + i + " ansible_host=<ip-" + i + ">");
     L.push("");
   };
@@ -1582,7 +1593,7 @@ function buildAnsibleInventory(r) {
   }
   if (r.svc.runtime) group("runtime_servers", findComp(r, "Runtime (server)"), r.ha ? 2 : 1);
   if (r.dbMode === "colocated") group("postgres_servers", null, r.ha ? 2 : 1);
-  L.push("[jpd:children]");
+  L.push("[jfrog_site:children]");
   L.push("artifactory_servers");
   if (r.provisionNginx) L.push("nginx_servers");
   if (r.xrayEnabled) L.push("xray_servers");
@@ -1798,7 +1809,7 @@ function buildArtifactPanel(r) {
       <blockquote style="white-space:pre; font-family:monospace; font-style:normal;">${escapeHtml(cmds)}</blockquote>
       <p style="margin:12px 0 4px; font-size:13px; color:var(--muted);">Generated <code>values.yaml</code> (sizing-derived — validate against your chart version):</p>
       <blockquote style="white-space:pre; font-family:monospace; font-style:normal; max-height:340px; overflow:auto;">${escapeHtml(values)}</blockquote>
-      <button class="export" id="artifactBtn">⤓ Download values.yaml</button>
+      <button class="export" id="artifactBtn">⤓ Download Helm values</button>
       <div class="hint" style="margin-top:8px;">Secrets are placeholders — supply <code>masterKey</code>/<code>joinKey</code>/DB &amp; Valkey passwords via Kubernetes Secrets. Resources use burstable QoS (requests ≈ 50%, limits = full tier). Autoscaling bounds are derived from the sized replica count. Reference: <a href="https://docs.jfrog.com/installation/docs/helm-charts-for-advanced-users" target="_blank">Install JFrog Platform with Helm</a>.</div>
     </details>`;
   }
@@ -1807,7 +1818,7 @@ function buildArtifactPanel(r) {
   const vars = buildAnsibleVarsFile(r);
   return `
     <details class="panel">
-      <summary style="font-size:14px;">Deployment artifacts — Virtual Machines (Ansible)</summary>
+      <summary style="font-size:14px;">Deployment artifacts — Servers / Ansible</summary>
       <p style="margin:10px 0 4px; font-size:13px; color:var(--muted);">Uses the official <a href="https://galaxy.ansible.com/ui/repo/published/jfrog/platform/" target="_blank">jfrog.platform</a> Ansible collection. Install deps: <code>ansible-galaxy collection install jfrog.platform community.general community.postgresql</code>. Set secrets in <code>group_vars/all/vars.yml</code> (Ansible Vault recommended), then run <code>ansible-playbook -i inventory.ini site.yml</code>.</p>
       <p style="margin:12px 0 4px; font-size:13px; color:var(--muted);"><strong>inventory.ini</strong> (hosts grouped by role, counts from the sizing):</p>
       <blockquote style="white-space:pre; font-family:monospace; font-style:normal; max-height:200px; overflow:auto;">${escapeHtml(inv)}</blockquote>
@@ -1823,13 +1834,13 @@ function buildArtifactPanel(r) {
 function downloadArtifact(r) {
   if (!r) return;
   if (r.deployment === "k8s") {
-    downloadText("jfrog-platform-values.yaml", buildHelmValues(r), "application/x-yaml");
+    downloadText(`jfrog-site-helm-${r.cloud}-${r.tier}-${new Date().toISOString().slice(0,10)}.yaml`, buildHelmValues(r), "application/x-yaml");
   } else {
     const bundle =
       "# ===== inventory.ini =====\n" + buildAnsibleInventory(r) +
       "\n\n# ===== site.yml =====\n" + buildAnsiblePlaybook(r) +
       "\n\n# ===== group_vars/all/vars.yml =====\n" + buildAnsibleVarsFile(r);
-    downloadText("jpd-ansible-bundle.txt", bundle, "text/plain");
+    downloadText(`jfrog-site-ansible-${r.cloud}-${r.tier}-${new Date().toISOString().slice(0,10)}.txt`, bundle, "text/plain");
   }
 }
 
@@ -1846,6 +1857,7 @@ function toggleConditionalFields() {
   const deployment = document.querySelector('input[name="deployment"]:checked').value;
   const topology   = document.querySelector('input[name="topology"]:checked').value;
   document.getElementById("k8sPlacementField").style.display = deployment === "k8s" ? "" : "none";
+  document.getElementById("infraTypeField").style.display = deployment === "vm" ? "" : "none";
   document.getElementById("passiveScaleField").style.display = topology === "active-passive" ? "" : "none";
   const usingLB = document.querySelector('input[name="lb"]:checked').value === "external";
   const nginxSkip = document.getElementById("nginxSkipRadio");
@@ -1854,6 +1866,17 @@ function toggleConditionalFields() {
     if (!usingLB) document.querySelector('input[name="nginx_rp"][value="provision"]').checked = true;
   }
   document.getElementById("valkeyField").style.display = document.getElementById("svcCuration").checked ? "" : "none";
+  // Xray artifacts dropdown — only when Xray is enabled.
+  const xrayEnabledCb = document.getElementById("xrayEnabled");
+  if (xrayEnabledCb) {
+    document.getElementById("xrayArtifactsField").style.display = xrayEnabledCb.checked ? "" : "none";
+  }
+  // Cache-fs warning when disabled.
+  const cacheFsWarn = document.getElementById("cacheFsWarn");
+  if (cacheFsWarn) {
+    cacheFsWarn.style.display =
+      document.querySelector('input[name="cachefs"]:checked')?.value === "no" ? "" : "none";
+  }
   // RabbitMQ is always Helm-deployed on K8s — hide the external toggle for K8s deployments.
   const rmqField = document.getElementById("rmqField");
   if (rmqField) {
@@ -1885,7 +1908,8 @@ function calculate() {
   const activeClientsInput = parseInt(document.getElementById("activeClients").value, 10) || 0;
   const rpmInput           = parseInt(document.getElementById("rpm").value, 10) || 0;
   const binaryTBInput      = parseFloat(document.getElementById("binaryStorageTB").value) || 0;
-  const xrayArtifactsInput = parseInt(document.getElementById("xrayArtifacts").value, 10) || 0;
+  const xrayChecked        = document.getElementById("xrayEnabled").checked;
+  const xrayArtifactsInput = xrayChecked ? (parseInt(document.getElementById("xrayArtifacts").value, 10) || 0) : 0;
 
   const activeClients = Math.round(activeClientsInput * growthFactor);
   const rpm           = Math.round(rpmInput * growthFactor);
@@ -1936,7 +1960,10 @@ function calculate() {
     ? "JFrog NGINX (bundled reverse proxy)"
     : { aws:"AWS ALB/NLB", azure:"Azure LB / Application Gateway", gcp:"Google Cloud Load Balancing", onprem:"External / hardware LB" }[cloud];
 
-  const xrayEnabled = xrayArtifacts > 0;
+  const xrayEnabled = xrayChecked;
+
+  const infraType = document.querySelector('input[name="infra_type"]:checked')?.value || "vm"; // vm | baremetal
+  const cpuLabel  = infraType === "baremetal" ? "cores" : "vCPU";
 
   // Per-tier DB connection caps (for the external-database max_connections guidance).
   const artiDbMaxConns = arch.artifactoryDb[tier].maxConns;
@@ -1963,22 +1990,53 @@ function calculate() {
 
   const components = [];
 
-  /* --- Artifactory --- */
-  // Distribution co-locates on Artifactory nodes: add 200 GB to its disk, note it, no new VMs.
+  /* --- Artifactory (+ co-located: Distribution, AppTrust, UnifiedPolicy on VMs) --- */
   let artiDisk = STORAGE.artifactory[tier].gb;
   let artiNote = "Each replica on its own VM (JFrog dedicated-instance rule).";
+  // Extra CPU/RAM added to the Artifactory host for VM co-located services.
+  // Not used on K8s — those services run as separate pods sized independently below.
+  let artiExtraCpu = 0, artiExtraMem = 0;
+
   if (svc.distribution) {
-    artiDisk += 200;
-    artiNote += " Distribution co-located (+200 GB).";
+    if (deployment === "k8s") {
+      // K8s: Distribution is a separate StatefulSet pod with its own PVC.
+      // A Distribution component will be pushed below — nothing to add to artiDisk here.
+      artiNote += " Distribution runs as a separate pod — see Distribution row.";
+    } else {
+      // VM/bare-metal: co-locates on each Artifactory host.
+      artiDisk += 200;               // JFrog HW matrix: 200 GB per node
+      artiExtraCpu += 2;            // JFrog HW matrix: 2 vCPU
+      artiExtraMem += 2;            // JFrog HW matrix: 2 GB
+      artiNote += ` Distribution co-located (+2 ${cpuLabel} / +2 GB / +200 GB — no separate VMs).`;
+    }
   }
   if (cacheFsGB > 0) {
     artiDisk += cacheFsGB;
     artiNote += ` Cache-fs +${cacheFsGB} GB local SSD (${cacheFsPct}% of binaries) fronting the object store.`;
   }
-  components.push(buildRow("artifactory", "Artifactory", {
+  if (svc.appTrust) {
+    if (deployment === "k8s") {
+      // K8s: AppTrust and UnifiedPolicy are separate pods on the Artifactory node pool.
+      // Their resource limits are counted in the cluster capacity plan via components below.
+      artiNote += " AppTrust + UnifiedPolicy run as separate pods on this node pool (see pool total).";
+    } else {
+      // VM/bare-metal: both services co-install on the same host as Artifactory.
+      // The Artifactory VM must be sized for the combined load.
+      artiExtraCpu = 4;  // AppTrust 2 + UnifiedPolicy 2 (JFrog hardware sizing matrix)
+      artiExtraMem = 2;  // AppTrust 1 GB + UnifiedPolicy 1 GB
+      artiDisk += 100;   // AppTrust 50 GB + UnifiedPolicy 50 GB
+      artiNote += ` AppTrust + UnifiedPolicy co-locate on this host (+4 ${cpuLabel} / +2 GB / +100 GB included in node sizing — no separate VMs).`;
+    }
+  }
+  const artiComp = buildRow("artifactory", "Artifactory", {
     storage: { gb: artiDisk, iops: STORAGE.artifactory[tier].iops, mbps: STORAGE.artifactory[tier].mbps },
     note: artiNote
-  }));
+  });
+  if (artiExtraCpu > 0) {
+    artiComp.cpu    += artiExtraCpu;
+    artiComp.memGB  += artiExtraMem;
+  }
+  components.push(artiComp);
 
   /* --- Nginx (only when bundled, or explicitly kept behind an external LB) --- */
   if (provisionNginx) {
@@ -2006,7 +2064,7 @@ function calculate() {
       xrayExtraMemGB  = jasMemGB;
       xrayExtraDiskGB = jasDiskGB;
       xrayName = "Xray + JAS";
-      xrayNote = `JAS runs inside the Xray pod (extraSystemYaml.jas.enabled: true) — no separate JAS node pool on K8s. JAS overhead per replica: +${jasCpu} vCPU / +${jasMemGB} GB RAM / +${jasDiskGB} GB disk.`;
+      xrayNote = `JAS runs inside the Xray pod (extraSystemYaml.jas.enabled: true) — no separate JAS node pool on K8s. JAS overhead per replica: +${jasCpu} ${cpuLabel} / +${jasMemGB} GB RAM / +${jasDiskGB} GB disk.`;
     }
     const xrayBaseArch = arch.xray[tier];
     const xrayBaseStor = STORAGE.xray[tier];
@@ -2070,7 +2128,7 @@ function calculate() {
         diskGB: jasDiskGB,
         iops: 3000,
         mbps: 500,
-        note: `JFrog JAS prerequisites: ${jasNodes} dedicated server${jasNodes > 1 ? "s" : ""} for ${xrayArtifacts.toLocaleString()} indexed artifacts (${jasCpu} vCPU / ${jasMemGB} GB RAM / ${jasDiskGB} GB SSD @ 3K IOPS). JAS modules run alongside Xray but on dedicated hosts.`
+        note: `JFrog JAS prerequisites: ${jasNodes} dedicated server${jasNodes > 1 ? "s" : ""} for ${xrayArtifacts.toLocaleString()} indexed artifacts (${jasCpu} ${cpuLabel} / ${jasMemGB} GB RAM / ${jasDiskGB} GB SSD @ 3K IOPS). JAS modules run alongside Xray but on dedicated hosts.`
       });
     }
     // K8s: no separate component — JAS is enabled inside the Xray chart (xray.jas.enabled: true).
@@ -2089,22 +2147,42 @@ function calculate() {
       note: "Hardware sizing matrix: 4 CPU / 4 GB / 50 GB. Requires Artifactory ≥ 7.98.4."
     });
   }
-  if (svc.appTrust) {
+  // AppTrust + UnifiedPolicy on K8s: separate pods that share the Artifactory node pool.
+  // Re-add them as components with the Artifactory instance type so k8sPlan() groups them
+  // into the same pool and the cluster capacity calculation includes their pod resource limits.
+  // On VMs, the overhead was already added directly to artiComp.cpu / artiComp.memGB above.
+  if (svc.appTrust && deployment === "k8s") {
+    const atReplicas = ha ? 2 : 1;
     components.push({
       name: "AppTrust",
-      replicas: ha ? 2 : 1,
-      instance: arch.nginx[tier].instance,
-      cpu: 2, memGB: 1, diskGB: 50, iops: 3000, mbps: 200,
-      note: "Hardware sizing matrix: 2 CPU / 1 GB / 50 GB."
+      replicas: atReplicas,
+      instance: arch.artifactory[tier].instance,
+      cpu: 1, memGB: 2, diskGB: 0, iops: 0, mbps: 0,
+      note: `Separate pod on the Artifactory node pool — no dedicated pool. Pod limits: 1 ${cpuLabel} / 2 GB.`
     });
     components.push({
       name: "UnifiedPolicy",
-      replicas: ha ? 2 : 1,
-      instance: arch.nginx[tier].instance,
-      cpu: 2, memGB: 1, diskGB: 50, iops: 3000, mbps: 200,
-      note: "Required alongside AppTrust. 2 CPU / 1 GB / 50 GB."
+      replicas: atReplicas,
+      instance: arch.artifactory[tier].instance,
+      cpu: 1, memGB: 1, diskGB: 0, iops: 0, mbps: 0,
+      note: `Separate pod on the Artifactory node pool — no dedicated pool. Pod limits: 0.5 ${cpuLabel} / 1 GB.`
     });
   }
+  // Distribution on K8s: separate StatefulSet with its own PVC — NOT tied to the
+  // Artifactory node pool. Uses a general-purpose (nginx-class) node.
+  // On VMs, the overhead was added to artiComp.cpu / artiComp.memGB above.
+  if (svc.distribution && deployment === "k8s") {
+    const distReplicas = ha ? 2 : 1;
+    const distDisk = ha ? 20 : 5;
+    components.push({
+      name: "Distribution",
+      replicas: distReplicas,
+      instance: arch.nginx[tier].instance,
+      cpu: 1, memGB: 2, diskGB: distDisk, iops: 3000, mbps: 200,
+      note: `Separate StatefulSet pod — own PVC (${distDisk} GB per replica). Pod limits: 1 ${cpuLabel} / 2 GB.`
+    });
+  }
+
   // Mission Control is bundled into Artifactory (a platform service on the
   // Artifactory router) — no standalone node and no separate database. The
   // selection only flips on the UI integration (artifactory.mc.enabled in Helm).
@@ -2163,7 +2241,7 @@ function calculate() {
   if (dbInstances === "dedicated" && dbProducts.length > 1) {
     dbProducts.forEach(d => components.push({
       name: `PostgreSQL (${d.label} DB)`, replicas: dbReplicas,
-      instance: dbMode === "external" ? d.instance : `Co-located ${d.cpu} vCPU / ${d.memGB} GB`,
+      instance: dbMode === "external" ? d.instance : `Co-located ${d.cpu} ${cpuLabel} / ${d.memGB} GB`,
       cpu: d.cpu, memGB: d.memGB, diskGB: d.diskGB, iops: d.iops, mbps: d.mbps,
       note: `${dbMode === "external" ? `External managed RDBMS (max ${d.maxConns} conns)` : "Co-located"} — dedicated instance for the ${d.label} database (${d.db}).${dbReplicas > 1 ? " Primary+standby for HA." : ""}`
     }));
@@ -2174,7 +2252,7 @@ function calculate() {
     const sumDisk = dbProducts.reduce((s, d) => s + d.diskGB, 0);
     components.push({
       name: "PostgreSQL (shared)", replicas: dbReplicas,
-      instance: dbMode === "external" ? big.instance : `Co-located ${big.cpu} vCPU / ${big.memGB} GB`,
+      instance: dbMode === "external" ? big.instance : `Co-located ${big.cpu} ${cpuLabel} / ${big.memGB} GB`,
       cpu: big.cpu, memGB: big.memGB, diskGB: sumDisk, iops: big.iops, mbps: big.mbps,
       note: `${dbMode === "external" ? "External managed RDBMS" : "Co-located"} — single instance hosting ${dbProducts.length} database${dbProducts.length === 1 ? "" : "s"} (${dbProducts.map(d => d.db).join(", ")}). Sized to the dominant (Artifactory) DB; set max_connections ≥ ${dbTotalConns}.${dbReplicas > 1 ? " Primary+standby for HA." : ""}`
     });
@@ -2236,7 +2314,8 @@ function calculate() {
     xrayArtifacts, xrayEnabled, svc,
     components, activeTotals,
     passiveComponents, passiveTotals,
-    binaryStorageTarget
+    binaryStorageTarget,
+    infraType, cpuLabel
   });
 }
 
@@ -2503,11 +2582,11 @@ function buildLicensePanel(r) {
       <div class="notice ${effClass}" style="margin-top:10px;">
         <strong>Minimum subscription for this configuration: ${effective}.</strong>
         ${r.svc.jas ? " Plus the <strong>JFrog Advanced Security</strong> add-on (on top of the Xray entitlement)." : ""}
-        One subscription licenses the whole JFrog Platform Deployment (JPD) — Xray, Distribution, Mission Control, etc. are entitlements within that tier, not separately-licensed servers.
+        One subscription licenses the whole JFrog Platform Site — Xray, Distribution, Mission Control, etc. are entitlements within that tier, not separately-licensed servers.
       </div>
       <div class="notice ${effClass}" style="margin-top:10px;">
         <strong>Licenses needed for this configuration: ${totalArti} Artifactory node license${totalArti === 1 ? "" : "s"}${splitNote}.</strong>
-        JPD is licensed per Artifactory node — one license per HA node, per site.${lic.edge ? " Distribution Edge nodes carry their own <strong>Edge licenses</strong> (counted separately)." : ""}
+        The platform is licensed per Artifactory node — one license per HA node, per site.${lic.edge ? " Distribution Edge nodes carry their own <strong>Edge licenses</strong> (counted separately)." : ""}
       </div>
       <table>
         <thead><tr><th>Product / capability</th><th>Min. subscription</th><th>Notes</th></tr></thead>
@@ -2525,6 +2604,11 @@ function buildLicensePanel(r) {
 /* ---------- Render ---------- */
 
 let lastResult = null; // most recent render() input, for CSV export
+
+function fmtInstance(inst, r) {
+  if (r.infraType !== "baremetal") return inst;
+  return inst.replace(/\bVM\b/g, "Server").replace(/\bvCPU\b/g, "core");
+}
 
 function render(r) {
   lastResult = r;
@@ -2611,7 +2695,7 @@ function render(r) {
         <h2>${label}</h2>
         <div class="summary-grid">
           <div class="stat"><div class="label">${nodeStatLabel}</div><div class="value">${t.nodes}</div></div>
-          <div class="stat"><div class="label">vCPU</div><div class="value">${t.cpu}</div></div>
+          <div class="stat"><div class="label">${r.cpuLabel}</div><div class="value">${t.cpu}</div></div>
           <div class="stat"><div class="label">Memory</div><div class="value">${t.mem}<span class="unit">GB</span></div></div>
           <div class="stat"><div class="label">Service disk</div><div class="value">${fmtGB(t.disk)}</div></div>
         </div>
@@ -2664,7 +2748,7 @@ function render(r) {
     };
     const cpName = { aws: "EKS", azure: "AKS", gcp: "GKE" }[r.cloud];
     const controlPlaneNote = r.cloud === "onprem"
-      ? "Self-managed control plane: add 3 dedicated control-plane nodes (4 vCPU / 8 GB each, stacked etcd) per cluster for quorum — not counted in the worker totals."
+      ? `Self-managed control plane: add 3 dedicated control-plane nodes (4 ${r.cpuLabel} / 8 GB each, stacked etcd) per cluster for quorum — not counted in the worker totals.`
       : `Managed control plane (${cpName}) — control-plane sizing &amp; HA are handled by the cloud provider, at no worker-node cost.`;
     const placementNote = r.k8sPlacement === "antiaffinity"
       ? "Anti-affinity (shared pool): stateful pods are spread across nodes but may share them — node count is an upper bound that bin-packing can reduce."
@@ -2675,11 +2759,11 @@ function render(r) {
         <div class="summary-grid">
           <div class="stat"><div class="label">Worker nodes</div><div class="value">${plan.workerNodes}</div></div>
           <div class="stat"><div class="label">Node pools</div><div class="value">${plan.pools.length}</div></div>
-          <div class="stat"><div class="label">Cluster vCPU</div><div class="value">${plan.clusterCPU}<span class="unit">w/ sys</span></div></div>
+          <div class="stat"><div class="label">Cluster ${r.cpuLabel}</div><div class="value">${plan.clusterCPU}<span class="unit">w/ sys</span></div></div>
           <div class="stat"><div class="label">Cluster RAM</div><div class="value">${plan.clusterMem}<span class="unit">GB w/ sys</span></div></div>
         </div>
         <table style="margin-top:12px;">
-          <thead><tr><th>Node pool (VM size)</th><th>vCPU</th><th>RAM</th><th>Nodes</th><th>Runs</th></tr></thead>
+          <thead><tr><th>Node pool (VM size)</th><th>${r.cpuLabel}</th><th>RAM</th><th>Nodes</th><th>Runs</th></tr></thead>
           <tbody>
             ${plan.pools.map(p => `
               <tr>
@@ -2699,7 +2783,7 @@ function render(r) {
           </tbody>
         </table>
         <div class="notice info" style="margin-top:12px;">
-          <strong>Cluster sizing:</strong> ${plan.workerNodes} worker nodes across ${plan.pools.length} node pool${plan.pools.length === 1 ? "" : "s"} provide <strong>${plan.workerCPU} vCPU / ${plan.workerMem} GB</strong> of pod-schedulable capacity. Adding ~15% for kubelet, OS, CNI and system DaemonSets, provision ≈ <strong>${plan.clusterCPU} vCPU / ${plan.clusterMem} GB</strong>. ${controlPlaneNote}${plan.dbNote}
+          <strong>Cluster sizing:</strong> ${plan.workerNodes} worker nodes across ${plan.pools.length} node pool${plan.pools.length === 1 ? "" : "s"} provide <strong>${plan.workerCPU} ${r.cpuLabel} / ${plan.workerMem} GB</strong> of pod-schedulable capacity. Adding ~15% for kubelet, OS, CNI and system DaemonSets, provision ≈ <strong>${plan.clusterCPU} ${r.cpuLabel} / ${plan.clusterMem} GB</strong>. ${controlPlaneNote}${plan.dbNote}
         </div>
         <div class="hint" style="margin-top:8px;">${placementNote}</div>
       </div>
@@ -2739,7 +2823,7 @@ function render(r) {
         <table>
           <thead>
             <tr>
-              <th>Component</th><th>Replicas</th><th>vCPU</th><th>RAM</th>
+              <th>Component</th><th>Replicas</th><th>${r.cpuLabel}</th><th>RAM</th>
               <th>Disk / IOPS</th><th>${instColHeader}</th><th>Notes</th>
             </tr>
           </thead>
@@ -2753,7 +2837,7 @@ function render(r) {
           <td>${c.cpu}</td>
           <td>${c.memGB} GB</td>
           <td>${fmtGB(c.diskGB)} <span class="hint">/ ${c.iops.toLocaleString()} IOPS</span></td>
-          <td><code>${c.instance}</code><br><span class="hint">${c.cpu} vCPU / ${c.memGB} GB</span></td>
+          <td><code>${fmtInstance(c.instance, r)}</code><br><span class="hint">${c.cpu} ${r.cpuLabel} / ${c.memGB} GB</span></td>
           <td><span class="hint">${c.note}</span></td>
         </tr>
       `;
@@ -2775,7 +2859,7 @@ function render(r) {
       : `${label} — ${r.cloudLabel} VM procurement list`;
     h += `<div class="panel"><h2>${procTitle}</h2>
       <table>
-        <thead><tr><th>VM type</th><th>vCPU</th><th>RAM</th><th>Count</th><th>Used by</th></tr></thead>
+        <thead><tr><th>VM type</th><th>${r.cpuLabel}</th><th>RAM</th><th>Count</th><th>Used by</th></tr></thead>
         <tbody>`;
     rows.forEach(([name, info]) => {
       h += `<tr>
@@ -2821,7 +2905,20 @@ function render(r) {
   html += `</tbody></table>`;
   // Show explicitly which rule was applied in this calculation
   const applied = [];
-  if (r.svc.distribution) applied.push("Distribution co-located onto Artifactory nodes (+200 GB disk, no new VMs).");
+  if (r.svc.distribution) {
+    if (r.deployment === "k8s") {
+      applied.push(`Distribution runs as a separate StatefulSet pod — own PVC (${r.ha ? 20 : 5} GB per replica), pod limits 1 ${r.cpuLabel} / 2 GB. Not co-located with Artifactory on Kubernetes.`);
+    } else {
+      applied.push(`Distribution co-located on Artifactory VMs (+2 ${r.cpuLabel} / +2 GB / +200 GB per node — no separate VMs).`);
+    }
+  }
+  if (r.svc.appTrust) {
+    if (r.deployment === "k8s") {
+      applied.push(`AppTrust + UnifiedPolicy run as separate pods on the Artifactory node pool (${r.ha ? 2 : 1} replica each). Pod limits: AppTrust 1 ${r.cpuLabel} / 2 GB, UnifiedPolicy 0.5 ${r.cpuLabel} / 1 GB — counted in the Artifactory pool capacity total.`);
+    } else {
+      applied.push(`AppTrust + UnifiedPolicy co-located on Artifactory VMs (+4 ${r.cpuLabel} / +2 GB / +100 GB per node — no separate VMs).`);
+    }
+  }
   if (r.xrayEnabled && r.externalRMQ) {
     applied.push(`RabbitMQ externalized — ${r.externalRmqSpec.replicas} node(s) provisioned and operated outside the platform (no RMQ nodes in this footprint). See the External RabbitMQ requirements below.`);
   }
@@ -2961,7 +3058,7 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
     <details class="panel" open>
       <summary style="font-size:14px;">External RabbitMQ — recommended sizing, plugins &amp; configuration</summary>
       <div class="notice info" style="margin-top:10px;">
-        <strong>Recommended external cluster:</strong> ${s.replicas} × <code>${s.instance}</code> (${s.cpu} vCPU / ${s.memGB} GB, ${fmtGB(s.diskGB)} disk @ ${s.iops.toLocaleString()} IOPS each)${isMulti ? " per site" : ""}. ${s.quorumNote} These nodes run on infrastructure you manage and are <strong>not</strong> counted in the platform footprint or Kubernetes cluster plan above.
+        <strong>Recommended external cluster:</strong> ${s.replicas} × <code>${s.instance}</code> (${s.cpu} ${r.cpuLabel} / ${s.memGB} GB, ${fmtGB(s.diskGB)} disk @ ${s.iops.toLocaleString()} IOPS each)${isMulti ? " per site" : ""}. ${s.quorumNote} These nodes run on infrastructure you manage and are <strong>not</strong> counted in the platform footprint or Kubernetes cluster plan above.
       </div>
       <p style="margin:12px 0 4px;"><strong>Plugins to enable</strong> (<code>rabbitmq-plugins enable …</code>):</p>
       <table>
@@ -3004,7 +3101,7 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
     <details class="panel" open>
       <summary style="font-size:14px;">External Valkey — recommended sizing &amp; configuration</summary>
       <div class="notice info" style="margin-top:10px;">
-        <strong>Recommended external cache:</strong> ${v.replicas} × <code>${v.instance}</code> (${v.cpu} vCPU / ${v.memGB} GB, ${fmtGB(v.diskGB)} disk each)${isMulti ? " per site" : ""}. ${v.replicas >= 3 ? "Odd node count for Sentinel/cluster quorum — tolerates 1 node failure." : "Single node — no failover."} Valkey (or Redis ≥ 7) backs the Catalog service; it runs on infrastructure you manage and is <strong>not</strong> counted in the platform footprint above.
+        <strong>Recommended external cache:</strong> ${v.replicas} × <code>${v.instance}</code> (${v.cpu} ${r.cpuLabel} / ${v.memGB} GB, ${fmtGB(v.diskGB)} disk each)${isMulti ? " per site" : ""}. ${v.replicas >= 3 ? "Odd node count for Sentinel/cluster quorum — tolerates 1 node failure." : "Single node — no failover."} Valkey (or Redis ≥ 7) backs the Catalog service; it runs on infrastructure you manage and is <strong>not</strong> counted in the platform footprint above.
       </div>
       <p style="margin:12px 0 4px;"><strong>Configuration checklist</strong>:</p>
       <ul style="margin:4px 0 10px; padding-left:20px; color:var(--muted); font-size:13px; line-height:1.7;">
@@ -3082,7 +3179,7 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
         <li>Replica counts above are for HA mode. Single-replica mode always uses 1 node per component regardless of tier.</li>
         <li>RabbitMQ is only deployed when Xray is enabled and runs on dedicated nodes for HA or &gt;100K indexed artifacts.</li>
         <li>JAS (<strong>VMs</strong>): dedicated servers scaled by artifact volume — 1 node (≤100K), 2 nodes (≤1M), 4 nodes (≤2M), 8 nodes (≤10M). <strong>Kubernetes</strong>: JAS runs within the Xray Helm chart (xray.jas.enabled) — no separate node pool.</li>
-        <li>Distribution co-locates onto Artifactory nodes (+200 GB disk, no additional VMs/pods).</li>
+        ${r.svc.distribution ? `<li><strong>Distribution</strong>: ${r.deployment === "k8s" ? "separate StatefulSet pod with its own PVC (5 GB non-HA / 20 GB HA), pod limits 1 vCPU / 2 GB" : "co-locates on Artifactory VMs (+2 vCPU / +2 GB / +200 GB per node — no separate VMs)"}.</li>` : ""}
       </ul>
     </details>
   `;
@@ -3094,8 +3191,8 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
       <p><strong>Effective tier</strong> = max of two inputs: concurrent connections tier (reference architecture: ≤100 Small, ≤500 Medium, ≤1,200 Large, ≤3,000 XLarge, ≤6,000 2XLarge) and RPM tier (≤6K Small, ≤50K Medium, ≤100K Large, ≤200K XLarge, ≤500K 2XLarge).</p>
       <p><strong>Per-cloud instance types &amp; replica counts</strong> are verbatim from JFrog's <a href="https://jfrog.com/reference-architecture/self-managed/deployment/sizing/" target="_blank">reference architecture pages</a>. Replicas by tier — Artifactory 1/2/3/4/6, Nginx and Xray 1/2/2/2/3, RabbitMQ 1/3/3/3/3. <strong>JAS</strong> deployment differs by model: on <em>VMs</em>, JAS requires dedicated servers scaled by artifact volume — 1 node (≤100K, 6 vCPU/24 GB/500 GB), 2 nodes (≤1M, 8 vCPU/24 GB/300 GB), 4 nodes (≤2M), 8 nodes (≤10M) per the <a href="https://docs.jfrog.com/installation/docs/jfrog-advanced-security-prerequisites" target="_blank">JAS prerequisites table</a>. On <em>Kubernetes</em>, JAS runs within the Xray Helm chart (xray.jas.enabled: true) — no separate node pool; ephemeral scan jobs run on the Xray pool or a tainted sub-pool.</p>
       <p><strong>Storage sizing</strong> (disk, IOPS, throughput) is from the <a href="https://jfrog.com/reference-architecture/self-managed/deployment/sizing/storage/" target="_blank">JFrog storage specification page</a>: Artifactory 500→1000 GB, Xray 100→200 GB, RabbitMQ 100 GB, JAS 300 GB; Artifactory DB = 1/3 of filestore at 4K–20K IOPS; Xray DB 500–2500 GB at 4K–12K IOPS.</p>
-      <p><strong>Co-location</strong>: Distribution is co-located onto Artifactory nodes (no extra VMs, +200 GB to Artifactory disk). Artifactory, Nginx, and Xray each require a dedicated VM per replica. On VMs, JAS also requires dedicated servers (separate from Xray). RabbitMQ runs split (separate VMs) for Xray HA or &gt;100K artifacts. On Kubernetes, JAS runs within the Xray chart (no extra nodes).</p>
-      <p><strong>Optional services</strong> (Workers, AppTrust + UnifiedPolicy) come from the <a href="https://jfrog.com/help/r/jfrog-installation-setup-documentation/hardware-sizing-matrix" target="_blank">JFrog hardware sizing matrix</a> — Workers 4/4/50, AppTrust &amp; UnifiedPolicy each 2/1/50. <strong>Mission Control</strong> is bundled into Artifactory (a platform service on the router) — it adds no standalone node or database; selecting it only enables the UI integration (<code>artifactory.mc.enabled</code>). <strong>Runtime Security</strong> installs as separate releases (<code>jfrog/runtime</code> + <code>jfrog/runtime-sensors</code>): a Runtime server (its own <code>runtime</code> DB) plus a per-node sensor DaemonSet that adds no dedicated nodes. <strong>Workers</strong> and <strong>Runtime</strong> are not part of the <code>jfrog-platform</code> umbrella chart.</p>
+      <p><strong>Co-location (VMs)</strong>: On VMs, Distribution co-locates on each Artifactory host (+2 vCPU / +2 GB / +200 GB per node — those numbers are added to the Artifactory row). AppTrust + UnifiedPolicy also co-locate on Artifactory VMs (+4 vCPU / +2 GB / +100 GB per node). Artifactory, Nginx, and Xray each require a dedicated VM per replica. JAS on VMs requires dedicated servers separate from Xray. RabbitMQ runs split (separate VMs) for Xray HA or &gt;100K artifacts.</p>
+      <p><strong>Co-location (Kubernetes)</strong>: On Kubernetes, Distribution is a separate StatefulSet pod with its own PVC (5 GB / 20 GB HA); pod limits 1 vCPU / 2 GB. AppTrust and UnifiedPolicy are separate pods that share the Artifactory node pool (no dedicated pool); their pod limits (AppTrust 1 CPU / 2 GB, UnifiedPolicy 0.5 CPU / 1 GB) are included in the pool capacity total. JAS runs within the Xray Helm chart (no extra node pool). <strong>Mission Control</strong> is bundled into the Artifactory router — no standalone node or database on any deployment model. <strong>Workers</strong> (4 CPU / 4 GB / 50 GB) and <strong>Runtime Security</strong> always get dedicated nodes. Workers and Runtime are not part of the <code>jfrog-platform</code> umbrella chart.</p>
       <p><strong>Onprem</strong>: JFrog does not publish a dedicated onprem sizing table, so this calculator mirrors the cloud CPU/RAM as generic VM sizes.</p>
       <p><strong>VM vs Kubernetes</strong>: capacity numbers are identical — they describe the worker-node footprint either way. On Kubernetes, per-pod <code>requests</code>/<code>limits</code> come from the JFrog Helm chart sizing presets and are typically smaller than the full VM allocation.</p>
     </details>
@@ -3107,13 +3204,12 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
   if (artifactBtn) artifactBtn.onclick = () => downloadArtifact(r);
 
   const diagramBtn = document.getElementById("diagramBtn");
-  if (diagramBtn) diagramBtn.onclick = () => downloadText(`jpd-architecture-${r.cloud}-${new Date().toISOString().slice(0, 10)}.svg`, buildArchitectureDiagram(r), "image/svg+xml");
+  if (diagramBtn) diagramBtn.onclick = () => downloadText(`jfrog-site-architecture-${r.cloud}-${r.tier}-${new Date().toISOString().slice(0, 10)}.svg`, buildArchitectureDiagram(r), "image/svg+xml");
 }
 
 /* ---------- Wire up ---------- */
 
-document.getElementById("calcBtn").addEventListener("click", calculate);
-document.getElementById("exportBtn").addEventListener("click", () => downloadCsv(lastResult));
+document.getElementById("exportBtn").addEventListener("click", () => downloadXlsx(lastResult));
 document.getElementById("inputs").addEventListener("change", calculate);
 document.getElementById("inputs").addEventListener("input", (e) => {
   if (e.target.type === "number") calculate();

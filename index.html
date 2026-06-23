@@ -3,8 +3,9 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>JFrog Platform Deployment (JPD) Sizing Calculator</title>
+<title>JFrog Platform Site Sizing Calculator</title>
 <link rel="stylesheet" href="common.css" />
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 </head>
 <body>
 
@@ -14,7 +15,7 @@
 </div>
 
 <header>
-  <h1>JFrog Platform Deployment (JPD) Sizing Calculator</h1>
+  <h1>JFrog Platform Site Sizing Calculator</h1>
   <p>Sizing based on the JFrog self-managed reference architecture &amp; hardware sizing matrix. Per-cloud instance types, replica counts, storage and co-location rules are pulled verbatim from JFrog's published tables.</p>
 </header>
 
@@ -38,10 +39,19 @@
     <div class="field">
       <label>Deployment model</label>
       <div class="radio-group" data-name="deployment">
-        <label><input type="radio" name="deployment" value="vm" checked /> Virtual Machines</label>
-        <label><input type="radio" name="deployment" value="k8s" /> Kubernetes</label>
+        <label><input type="radio" name="deployment" value="k8s" checked /> Kubernetes</label>
+        <label><input type="radio" name="deployment" value="vm" /> Servers (VMs / bare metal)</label>
       </div>
-      <div class="hint">VMs size one host per replica. Kubernetes shows the same capacity as worker-node recommendations and adds a per-site cluster plan (node pools, sizing, control plane).</div>
+      <div class="hint">Kubernetes shows worker-node recommendations and a per-site cluster plan. Servers sizes one host per replica and generates an Ansible bundle.</div>
+    </div>
+
+    <div class="field" id="infraTypeField">
+      <label>Server type</label>
+      <div class="radio-group" data-name="infra_type">
+        <label><input type="radio" name="infra_type" value="vm" checked /> Virtual machine</label>
+        <label><input type="radio" name="infra_type" value="baremetal" /> Bare metal</label>
+      </div>
+      <div class="hint">Bare metal uses physical CPU cores (not vCPU) — sizing figures are identical, the label changes from vCPU to cores in the output.</div>
     </div>
 
     <div class="field" id="k8sPlacementField" style="display:none;">
@@ -97,6 +107,7 @@
         <label><input type="radio" name="cachefs" value="no" /> Disabled</label>
       </div>
       <div class="hint">A local SSD cache on each Artifactory node fronts the object store, serving hot binaries at local-disk latency. Recommended whenever binaries live in object storage.</div>
+      <div class="notice warn" id="cacheFsWarn" style="display:none; margin-top:6px;">Disabling cache-fs means every binary read goes directly to object storage. This significantly increases latency and egress cost for hot artifacts and is only suitable for on-prem or all-flash storage that is already local. Enable it unless you have a specific reason not to.</div>
     </div>
 
     <div class="field">
@@ -106,16 +117,23 @@
     </div>
 
     <div class="field">
-      <label>Estimated indexed artifacts (Xray)</label>
+      <label>Xray (security &amp; compliance scanning)</label>
+      <div class="checkbox-group">
+        <label><input type="checkbox" id="xrayEnabled" checked /> Enable Xray</label>
+      </div>
+      <div class="hint">Enables Xray, RabbitMQ, and JAS. When disabled, none of these are sized or deployed.</div>
+    </div>
+
+    <div class="field" id="xrayArtifactsField">
+      <label>Estimated indexed artifacts</label>
       <select id="xrayArtifacts">
-        <option value="0">No Xray</option>
         <option value="100000" selected>Up to 100K</option>
         <option value="1000000">Up to 1M</option>
         <option value="2000000">Up to 2M</option>
         <option value="10000000">Up to 10M</option>
         <option value="20000000">Over 10M (support)</option>
       </select>
-      <div class="hint">Drives Xray node size, RabbitMQ replica count and Xray DB sizing. Over 100K artifacts forces RabbitMQ split mode; "No Xray" omits Xray, RabbitMQ and JAS entirely.</div>
+      <div class="hint">Drives Xray node size, RabbitMQ replica count and Xray DB sizing. Over 100K artifacts forces RabbitMQ split mode.</div>
     </div>
 
     <div class="field">
@@ -171,7 +189,7 @@
         <label><input type="checkbox" id="svcCuration" /> Curation + Catalog</label>
         <label><input type="checkbox" id="svcRuntime" /> Runtime Security</label>
       </div>
-      <div class="hint">Distribution co-locates on Artifactory (+200 GB, no new VMs). Mission Control is bundled into Artifactory (no separate node or DB). JAS requires Xray; on VMs it adds dedicated servers, on Kubernetes it runs within the Xray Helm chart (no extra nodes). Workers and AppTrust + UnifiedPolicy add their own nodes per the hardware sizing matrix. Curation adds the Catalog service (+ its own DB and a Valkey cache). Runtime Security adds a Runtime server (+ its own DB) and a per-node sensor DaemonSet — both as separate Helm releases.</div>
+      <div class="hint">Distribution co-locates on Artifactory (+200 GB, no new VMs). Mission Control is bundled into Artifactory (no separate node or DB). JAS requires Xray; on VMs it adds dedicated servers, on Kubernetes it runs within the Xray Helm chart (no extra nodes). Workers add their own nodes per the hardware sizing matrix. AppTrust + UnifiedPolicy co-locate on Artifactory nodes (small overhead — no dedicated VMs or node pools). Curation adds the Catalog service (+ its own DB and a Valkey cache). Runtime Security adds a Runtime server (+ its own DB) and a per-node sensor DaemonSet — both as separate Helm releases.</div>
     </div>
 
     <div class="field" id="valkeyField" style="display:none;">
@@ -201,8 +219,7 @@
       <div class="hint">Shared = one PostgreSQL instance hosting a logical database per product (the typical setup; the Helm chart's bundled DB works this way). Dedicated = a separate instance per product (more DB nodes). Each product always gets its own logical database either way.</div>
     </div>
 
-    <button class="calc" id="calcBtn">Calculate sizing</button>
-    <button class="export" id="exportBtn">⤓ Export to CSV</button>
+    <button class="export" id="exportBtn">⤓ Export to XLSX</button>
   </div>
 
   <!-- OUTPUT PANEL -->
