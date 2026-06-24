@@ -2062,7 +2062,7 @@ function calculate() {
       xrayExtraMemGB  = jasMemGB;
       xrayExtraDiskGB = jasDiskGB;
       xrayName = "Xray + JAS";
-      xrayNote = `JAS runs inside the Xray pod (extraSystemYaml.jas.enabled: true) — no separate JAS node pool on K8s. JAS overhead per replica: +${jasCpu} ${cpuLabel} / +${jasMemGB} GB RAM / +${jasDiskGB} GB disk.`;
+      xrayNote = `JAS runs inside the Xray pod (extraSystemYaml.jas.enabled: true) — no separate JAS node pool on K8s. JAS overhead per replica: +${jasCpu} ${cpuLabel} / +${jasMemGB} GB RAM / +${jasDiskGB} GB disk. Ephemeral scanner jobs (exposuresscannersjob etc.) need additional node headroom — see Notes &amp; warnings.`;
     }
     const xrayBaseArch = arch.xray[tier];
     const xrayBaseStor = STORAGE.xray[tier];
@@ -2667,6 +2667,10 @@ function render(r) {
   if (r.xrayArtifacts > 10000000)        warnings.push({type:"danger", text:"Indexed artifacts exceed 10M — contact JFrog Support."});
   if (r.svc.jas && !r.xrayEnabled)       warnings.push({type:"warn",   text:"JAS requires Xray. Enable Xray or uncheck JAS — it has been skipped."});
   if (r.deployment === "k8s")            warnings.push({type:"info",   text:"<strong>Kubernetes:</strong> the per-replica vCPU/RAM below represent the worker-node capacity each pod needs. JFrog's Helm chart sizing presets (in <code>jfrog/charts</code>) define authoritative per-pod requests/limits — typically smaller because requests are floors, not host totals."});
+  if (r.svc.jas && r.xrayEnabled && r.deployment === "k8s") {
+    const jasConcurrent = r.xrayArtifacts <= 100000 ? 1 : r.xrayArtifacts <= 1000000 ? 2 : r.xrayArtifacts <= 2000000 ? 4 : 8;
+    warnings.push({type:"info", text:`<strong>JAS ephemeral scan jobs:</strong> each scanner pod (exposuresscannersjob, secretsscannersjob, iacsscannersjob, sastscannersjob) needs <strong>2 vCPU / 4 GB RAM</strong> on top of the Xray pod overhead above. For ${r.xrayArtifacts.toLocaleString()} indexed artifacts, plan for up to <strong>${jasConcurrent} concurrent scan job${jasConcurrent > 1 ? "s" : ""}</strong> — reserve an extra <strong>${jasConcurrent * 2} vCPU / ${jasConcurrent * 4} GB RAM</strong> on the node pool. Set <code>xray.jas.executionService.cpuRequest: "2"</code> and <code>memRequest: "4Gi"</code> equal to the limits so jobs are scheduled predictably. Optionally pin scan jobs to a dedicated tainted node pool via <code>xray.jas.executionService.affinityLabelKey/Value</code>.`});
+  }
   {
     const licTier = licenseEffectiveTier(r);
     warnings.push({type: licTier === "Enterprise+" ? "warn" : "info",
@@ -2674,7 +2678,7 @@ function render(r) {
   }
 
   if (warnings.length) {
-    html += `<details class="panel"><summary style="font-size:14px;">Notes &amp; warnings</summary>`;
+    html += `<details class="panel" open><summary style="font-size:14px;">Notes &amp; warnings</summary>`;
     warnings.forEach(w => {
       const cls = w.type === "danger" ? "danger" : w.type === "info" ? "info" : "";
       html += `<div class="notice ${cls}" style="margin-bottom:8px;">${w.text}</div>`;
@@ -2828,7 +2832,7 @@ function render(r) {
   const instColHeader = r.deployment === "k8s" ? "Recommended node-pool VM" : "VM instance";
   function clusterSection(label, comps) {
     let h = `
-      <details class="panel">
+      <details class="panel" open>
         <summary style="font-size:14px;">${label} — per-component sizing (${r.cloudLabel} ${tierName}, ${deployLabel})</summary>
         <table>
           <thead>
