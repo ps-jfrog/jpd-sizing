@@ -1,0 +1,17 @@
+{
+  "name": "jpd-sizing-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scraper that keeps sizing-data.json in sync with JFrog reference architecture docs.",
+  "main": "scrape-sizing.js",
+  "scripts": {
+    "scrape": "node scrape-sizing.js",
+    "scrape:dry": "node scrape-sizing.js --dry-run"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0"
+  }
+}

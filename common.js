@@ -47,7 +47,8 @@ function maxTier(a, b) {
 }
 
 // Replicas per tier per component (reference architecture, identical across clouds).
-const REPLICAS = {
+// Fallback values — overridden at runtime by sizing-data.json when served over HTTP.
+let REPLICAS = {
   artifactory: { small:1, medium:2, large:3, xlarge:4, "2xlarge":6 },
   nginx:       { small:1, medium:2, large:2, xlarge:2, "2xlarge":3 },
   xray:        { small:1, medium:2, large:2, xlarge:2, "2xlarge":3 },
@@ -56,7 +57,8 @@ const REPLICAS = {
 };
 
 // JFrog-published instance types per cloud per tier per component.
-const REF_ARCH = {
+// Fallback values — overridden at runtime by sizing-data.json when served over HTTP.
+let REF_ARCH = {
   aws: {
     artifactory: {
       small:     { instance:"m8g.2xlarge", cpu:8,  memGB:32 },
@@ -265,10 +267,11 @@ const REF_ARCH = {
 };
 
 // Per-tier storage (size, IOPS, MB/s) — from the JFrog storage specification page.
-const STORAGE = {
+// Fallback values — overridden at runtime by sizing-data.json when served over HTTP.
+let STORAGE = {
   artifactory:   { small:{gb:500, iops:3000, mbps:500 },  medium:{gb:500, iops:3000, mbps:500 },  large:{gb:1000,iops:6000, mbps:1000}, xlarge:{gb:1000,iops:6000, mbps:1000}, "2xlarge":{gb:1000,iops:6000, mbps:1000} },
   xray:          { small:{gb:100, iops:3000, mbps:500 },  medium:{gb:100, iops:3000, mbps:500 },  large:{gb:200, iops:6000, mbps:1000}, xlarge:{gb:200, iops:6000, mbps:1000}, "2xlarge":{gb:200, iops:6000, mbps:1000} },
-  rabbitmq:      { small:{gb:100, iops:3000, mbps:500 },  medium:{gb:100, iops:3000, mbps:500 },  large:{gb:100, iops:3000, mbps:500 }, xlarge:{gb:100, iops:3000, mbps:500 }, "2xlarge":{gb:100, iops:3000, mbps:500 } },
+  rabbitmq:      { small:{gb:250, iops:3000, mbps:500 },  medium:{gb:250, iops:3000, mbps:500 },  large:{gb:250, iops:3000, mbps:500 }, xlarge:{gb:250, iops:3000, mbps:500 }, "2xlarge":{gb:250, iops:3000, mbps:500 } },
   jas:           { small:{gb:300, iops:3000, mbps:500 },  medium:{gb:300, iops:3000, mbps:500 },  large:{gb:300, iops:3000, mbps:500 }, xlarge:{gb:300, iops:3000, mbps:500 }, "2xlarge":{gb:300, iops:3000, mbps:500 } },
   // Artifactory DB disk is "1/3 of filestore" with these IOPS/throughput per tier.
   artifactoryDb: { small:{frac:1/3, iops:4000, mbps:500 },  medium:{frac:1/3, iops:6000, mbps:600 },  large:{frac:1/3, iops:10000, mbps:800}, xlarge:{frac:1/3, iops:12000, mbps:1000}, "2xlarge":{frac:1/3, iops:20000, mbps:1500} },
@@ -3231,7 +3234,19 @@ function paintRadioStates() {
 document.addEventListener("change", paintRadioStates);
 paintRadioStates();
 toggleConditionalFields();
-calculate();
+
+/* Load sizing-data.json for the latest JFrog-published numbers.
+   Falls back to the hardcoded constants above when opened as file:// or when
+   the file is unreachable (network error, missing file, etc.). */
+fetch('./sizing-data.json')
+  .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+  .then(data => {
+    if (data.REF_ARCH) REF_ARCH = data.REF_ARCH;
+    if (data.STORAGE)  STORAGE  = data.STORAGE;
+    if (data.REPLICAS) REPLICAS = data.REPLICAS;
+    calculate();
+  })
+  .catch(() => calculate()); // Fallback: hardcoded constants are already set.
 
 /* ---------- Input-panel tooltips ---------- */
 (function initTooltips() {
