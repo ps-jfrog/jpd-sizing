@@ -2674,27 +2674,27 @@ function render(r) {
   }
 
   if (warnings.length) {
-    html += `<div class="panel"><h2>Notes &amp; warnings</h2>`;
+    html += `<details class="panel"><summary style="font-size:14px;">Notes &amp; warnings</summary>`;
     warnings.forEach(w => {
       const cls = w.type === "danger" ? "danger" : w.type === "info" ? "info" : "";
       html += `<div class="notice ${cls}" style="margin-bottom:8px;">${w.text}</div>`;
     });
-    html += `</div>`;
+    html += `</details>`;
   }
 
   /* Aggregate footprint */
   const nodeStatLabel = r.deployment === "k8s" ? "Total nodes" : "VM instances";
   function footprintCard(label, t) {
     return `
-      <div class="panel">
-        <h2>${label}</h2>
+      <details class="panel">
+        <summary style="font-size:14px;">${label}</summary>
         <div class="summary-grid">
           <div class="stat"><div class="label">${nodeStatLabel}</div><div class="value">${t.nodes}</div></div>
           <div class="stat"><div class="label">${r.cpuLabel}</div><div class="value">${t.cpu}</div></div>
           <div class="stat"><div class="label">Memory</div><div class="value">${t.mem}<span class="unit">GB</span></div></div>
           <div class="stat"><div class="label">Storage</div><div class="value">${fmtGB(t.disk)}</div></div>
         </div>
-      </div>
+      </details>
     `;
   }
   if (isMulti) {
@@ -2749,8 +2749,8 @@ function render(r) {
       ? "Anti-affinity (shared pool): stateful pods are spread across nodes but may share them — node count is an upper bound that bin-packing can reduce."
       : "Dedicated node pool: one Artifactory/Nginx/Xray pod per node. Smaller stateless pods can share nodes — figures are a safe upper bound.";
     const k8sPlanCard = (label, plan) => `
-      <div class="panel">
-        <h2>Kubernetes cluster plan — ${label}</h2>
+      <details class="panel">
+        <summary style="font-size:14px;">Kubernetes cluster plan — ${label}</summary>
         <div class="summary-grid">
           <div class="stat"><div class="label">Worker nodes</div><div class="value">${plan.workerNodes}</div></div>
           <div class="stat"><div class="label">Node pools</div><div class="value">${plan.pools.length}</div></div>
@@ -2795,7 +2795,7 @@ function render(r) {
           <strong>Cluster sizing:</strong> ${plan.workerNodes} worker nodes across ${plan.pools.length} node pool${plan.pools.length === 1 ? "" : "s"} provide <strong>${plan.workerCPU} ${r.cpuLabel} / ${plan.workerMem} GB</strong> of pod-schedulable capacity. Adding ~15% for kubelet, OS, CNI and system DaemonSets, provision ≈ <strong>${plan.clusterCPU} ${r.cpuLabel} / ${plan.clusterMem} GB</strong>. ${controlPlaneNote}${plan.dbNote}
         </div>
         <div class="hint" style="margin-top:8px;">${placementNote}</div>
-      </div>
+      </details>
     `;
     if (isMulti) {
       html += k8sPlanCard(siteALabel, k8sPlan(r.components));
@@ -2807,7 +2807,8 @@ function render(r) {
 
   // Storage + network row (shared across topology)
   html += `
-    <div class="panel">
+    <details class="panel">
+      <summary style="font-size:14px;">Storage &amp; network</summary>
       <div class="totals">
         <div class="total-card">
           <div class="label">Binary / artifact storage</div>
@@ -2820,15 +2821,15 @@ function render(r) {
           <div class="hint" style="margin-top:6px;">${NETWORK_REC[r.cloud]}${isMulti ? ` Cross-site ${isAA ? "bidirectional " : ""}replication: ensure adequate WAN bandwidth + low latency for federation.` : ""}</div>
         </div>
       </div>
-    </div>
+    </details>
   `;
 
   /* Per-component table + procurement tally — rendered per cluster */
   const instColHeader = r.deployment === "k8s" ? "Recommended node-pool VM" : "VM instance";
   function clusterSection(label, comps) {
     let h = `
-      <div class="panel">
-        <h2>${label} — per-component sizing (${r.cloudLabel} ${tierName}, ${deployLabel})</h2>
+      <details class="panel">
+        <summary style="font-size:14px;">${label} — per-component sizing (${r.cloudLabel} ${tierName}, ${deployLabel})</summary>
         <table>
           <thead>
             <tr>
@@ -2851,7 +2852,7 @@ function render(r) {
         </tr>
       `;
     });
-    h += `</tbody></table></div>`;
+    h += `</tbody></table></details>`;
 
     // Procurement tally for this cluster
     const tally = {};
@@ -2865,7 +2866,7 @@ function render(r) {
     const total = rows.reduce((s,[,v]) => s + v.count, 0);
     if (r.deployment === "k8s") return h;
     const procTitle = `${label} — ${r.cloudLabel} VM procurement list`;
-    h += `<div class="panel"><h2>${procTitle}</h2>
+    h += `<details class="panel"><summary style="font-size:14px;">${procTitle}</summary>
       <table>
         <thead><tr><th>VM type</th><th>${r.cpuLabel}</th><th>RAM</th><th>Count</th><th>Used by</th></tr></thead>
         <tbody>`;
@@ -2882,7 +2883,7 @@ function render(r) {
         <td colspan="3"><strong>Total VM instances</strong></td>
         <td><strong>${total}</strong></td>
         <td></td>
-      </tr></tbody></table></div>`;
+      </tr></tbody></table></details>`;
     return h;
   }
 
@@ -3063,7 +3064,7 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
   if (r.xrayEnabled && r.externalRMQ) {
     const s = r.externalRmqSpec;
     html += `
-    <details class="panel" open>
+    <details class="panel">
       <summary style="font-size:14px;">External RabbitMQ — recommended sizing, plugins &amp; configuration</summary>
       <div class="notice info" style="margin-top:10px;">
         <strong>Recommended external cluster:</strong> ${s.replicas} × <code>${s.instance}</code> (${s.cpu} ${r.cpuLabel} / ${s.memGB} GB, ${fmtGB(s.diskGB)} disk @ ${s.iops.toLocaleString()} IOPS each)${isMulti ? " per site" : ""}. ${s.quorumNote} These nodes run on infrastructure you manage and are <strong>not</strong> counted in the platform footprint or Kubernetes cluster plan above.
@@ -3106,7 +3107,7 @@ GRANT ALL PRIVILEGES ON DATABASE &lt;db&gt; TO &lt;user&gt;;</blockquote>
   if (r.svc.curation && r.externalValkey) {
     const v = r.externalValkeySpec;
     html += `
-    <details class="panel" open>
+    <details class="panel">
       <summary style="font-size:14px;">External Valkey — recommended sizing &amp; configuration</summary>
       <div class="notice info" style="margin-top:10px;">
         <strong>Recommended external cache:</strong> ${v.replicas} × <code>${v.instance}</code> (${v.cpu} ${r.cpuLabel} / ${v.memGB} GB, ${fmtGB(v.diskGB)} disk each)${isMulti ? " per site" : ""}. ${v.replicas >= 3 ? "Odd node count for Sentinel/cluster quorum — tolerates 1 node failure." : "Single node — no failover."} Valkey (or Redis ≥ 7) backs the Catalog service; it runs on infrastructure you manage and is <strong>not</strong> counted in the platform footprint above.
