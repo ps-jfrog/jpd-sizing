@@ -183,17 +183,16 @@
     </div>
 
     <div class="field" id="valkeyField" style="display:none;">
-      <label>Valkey (Curation / Catalog cache) <span class="tip-icon" data-tip="Only applies when Curation is enabled. Co-located runs Valkey on the Catalog nodes (adds RAM, no new VMs); External uses a managed/standalone Valkey (or Redis) cluster — removed from the footprint, with a recommended size + config shown.">i</span></label>
+      <label>Valkey (Curation / Catalog cache) <span class="tip-icon" data-tip="Only applies when Curation is enabled. Kubernetes: Helm deployed bundles Valkey in the jfrog-platform chart (no separate nodes); External uses a standalone Valkey/Redis cluster outside the Helm chart. Servers: always external.">i</span></label>
       <div class="radio-group" data-name="valkey">
-        <label><input type="radio" name="valkey" value="colocated" /> Co-located</label>
-        <label><input type="radio" name="valkey" value="external" checked /> External</label>
+        <label id="valkeyColocatedOption"><input type="radio" name="valkey" value="colocated" checked /> <span id="valkeyColocatedText">Co-located</span></label>
+        <label><input type="radio" name="valkey" value="external" /> External</label>
       </div>
     </div>
 
     <div class="field">
-      <label>Database <span class="tip-icon" data-tip="Co-located = a PostgreSQL provisioned with the deployment (the Helm chart's bundled DB on K8s, or DB nodes alongside the platform on VMs) — it counts toward the footprint. External = any managed/standalone RDBMS you run separately (RDS / Cloud SQL / Flexible Server / self-managed), sized here but outside the footprint.">i</span></label>
+      <label>Database <span class="tip-icon" data-tip="Always provision a managed or self-hosted RDBMS that is accessible to JFrog services — RDS / Cloud SQL / Flexible Server or your own PostgreSQL. The calculator sizes each database but does not count the DB nodes in the platform footprint.">i</span></label>
       <div class="radio-group" data-name="db">
-        <label><input type="radio" name="db" value="colocated" /> Co-located</label>
         <label><input type="radio" name="db" value="external" checked /> External</label>
       </div>
     </div>

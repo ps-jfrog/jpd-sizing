@@ -1884,6 +1884,23 @@ function toggleConditionalFields() {
       if (bundledRadio) bundledRadio.checked = true;
     }
   }
+
+  const isVm = deployment === "vm";
+
+  // Valkey: Servers always use external Valkey; K8s bundles it in the Helm chart
+  // ("Helm deployed") or externalises it. Relabel the co-located option accordingly.
+  const valkeyColocatedOption = document.getElementById("valkeyColocatedOption");
+  if (valkeyColocatedOption) {
+    if (isVm) {
+      valkeyColocatedOption.style.display = "none";
+      document.querySelector('input[name="valkey"][value="external"]').checked = true;
+    } else {
+      valkeyColocatedOption.style.display = "";
+      document.getElementById("valkeyColocatedText").textContent = "Helm deployed";
+    }
+  }
+
+  paintRadioStates();
 }
 
 function calculate() {
@@ -2856,6 +2873,20 @@ function render(r) {
         </tr>
       `;
     });
+    if (r.svc.curation && r.externalValkey && r.externalValkeySpec) {
+      const v = r.externalValkeySpec;
+      h += `
+        <tr style="opacity:0.8;">
+          <td><strong>Valkey</strong>&nbsp;<span class="chip warn" style="font-size:10px;padding:1px 5px;vertical-align:middle;">external</span></td>
+          <td>${v.replicas}</td>
+          <td>${v.cpu}</td>
+          <td>${v.memGB} GB</td>
+          <td>${fmtGB(v.diskGB)} <span class="hint">/ ${v.iops.toLocaleString()} IOPS</span></td>
+          <td><code>${fmtInstance(v.instance, r)}</code><br><span class="hint">${v.cpu} ${r.cpuLabel} / ${v.memGB} GB</span></td>
+          <td><span class="hint">External Valkey cache for Catalog — provisioned separately, not counted in the footprint totals above. See the External Valkey section below for configuration details.</span></td>
+        </tr>
+      `;
+    }
     h += `</tbody></table></details>`;
 
     // Procurement tally for this cluster
